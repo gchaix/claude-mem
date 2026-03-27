@@ -523,6 +523,22 @@ export class PendingMessageStore {
   }
 
   /**
+   * Retry all failed messages by resetting them to pending with a fresh retry count.
+   * Resets retry_count to 0 so messages get a full set of retry attempts again.
+   * @returns Number of messages reset to pending
+   */
+  retryAllFailed(): number {
+    const stmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending', retry_count = 0,
+          started_processing_at_epoch = NULL, completed_at_epoch = NULL
+      WHERE status = 'failed'
+    `);
+    const result = stmt.run();
+    return result.changes;
+  }
+
+  /**
    * Clear all pending, processing, and failed messages from the queue
    * Keeps only processed messages (for history)
    * @returns Number of messages deleted

@@ -3,9 +3,11 @@
  * Check and process pending observation queue
  *
  * Usage:
- *   bun scripts/check-pending-queue.ts           # Check status and prompt to process
- *   bun scripts/check-pending-queue.ts --process # Auto-process without prompting
- *   bun scripts/check-pending-queue.ts --limit 5 # Process up to 5 sessions
+ *   bun scripts/check-pending-queue.ts                    # Check status and prompt to process
+ *   bun scripts/check-pending-queue.ts --process          # Auto-process without prompting
+ *   bun scripts/check-pending-queue.ts --limit 5          # Process up to 5 sessions
+ *   bun scripts/check-pending-queue.ts --retry-failed     # Retry all failed messages
+ *   bun scripts/check-pending-queue.ts --retry-failed --process  # Retry and auto-process
  */
 
 const WORKER_URL = 'http://localhost:37777';
@@ -41,6 +43,11 @@ interface ProcessResponse {
   startedSessionIds: number[];
 }
 
+interface RetryFailedResponse {
+  success: boolean;
+  retriedCount: number;
+}
+
 async function checkWorkerHealth(): Promise<boolean> {
   try {
     const res = await fetch(`${WORKER_URL}/api/health`);
@@ -66,6 +73,17 @@ async function processQueue(limit: number): Promise<ProcessResponse> {
   });
   if (!res.ok) {
     throw new Error(`Failed to process queue: ${res.status}`);
+  }
+  return res.json();
+}
+
+async function retryFailedQueue(): Promise<RetryFailedResponse> {
+  const res = await fetch(`${WORKER_URL}/api/pending-queue/retry-failed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to retry failed queue: ${res.status}`);
   }
   return res.json();
 }
@@ -113,9 +131,10 @@ Usage:
   bun scripts/check-pending-queue.ts [options]
 
 Options:
-  --help, -h     Show this help message
-  --process      Auto-process without prompting
-  --limit N      Process up to N sessions (default: 10)
+  --help, -h       Show this help message
+  --process        Auto-process without prompting
+  --retry-failed   Retry all failed messages (reset to pending)
+  --limit N        Process up to N sessions (default: 10)
 
 Examples:
   # Check queue status interactively
@@ -127,6 +146,12 @@ Examples:
   # Process up to 5 sessions
   bun scripts/check-pending-queue.ts --process --limit 5
 
+  # Retry all failed messages interactively
+  bun scripts/check-pending-queue.ts --retry-failed
+
+  # Retry failed messages and auto-process them
+  bun scripts/check-pending-queue.ts --retry-failed --process
+
 What is this for?
   If the claude-mem worker crashes or restarts, pending observations may
   be left unprocessed. This script shows the backlog and lets you trigger
@@ -137,6 +162,7 @@ What is this for?
   }
 
   const autoProcess = args.includes('--process');
+  const retryFailed = args.includes('--retry-failed');
   const limitArg = args.find((_, i) => args[i - 1] === '--limit');
   const limit = limitArg ? parseInt(limitArg, 10) : 10;
 
@@ -163,11 +189,42 @@ What is this for?
   console.log(`  Stuck:      ${queue.stuckCount} (processing > 5 min)`);
   console.log(`  Sessions:   ${sessionsWithPendingWork.length} with pending work\n`);
 
+  // Handle --retry-failed: reset failed messages to pending before processing
+  if (retryFailed) {
+    if (queue.totalFailed > 0) {
+      console.log(`Retrying ${queue.totalFailed} failed messages...\n`);
+      const retryResult = await retryFailedQueue();
+      console.log(`Reset ${retryResult.retriedCount} failed messages to pending.\n`);
+
+      if (!autoProcess) {
+        const answer = await prompt(`Process retried messages? (up to ${limit} sessions) [y/N]: `);
+        if (answer.toLowerCase() !== 'y') {
+          console.log('\nSkipped. Run with --process to auto-process.\n');
+          process.exit(0);
+        }
+        console.log('');
+        const result = await processQueue(limit);
+        console.log('Processing Result:');
+        console.log(`  Sessions started: ${result.sessionsStarted}`);
+        console.log(`  Sessions skipped: ${result.sessionsSkipped} (already active)`);
+        console.log(`  Remaining:        ${result.totalPendingSessions - result.sessionsStarted}`);
+        if (result.startedSessionIds.length > 0) {
+          console.log(`  Started IDs:      ${result.startedSessionIds.join(', ')}`);
+        }
+        console.log('\nProcessing started in background. Check status again in a few minutes.\n');
+        process.exit(0);
+      }
+      // --process also set: fall through to auto-process block below
+    } else {
+      console.log('No failed messages to retry.\n');
+    }
+  }
+
   // Check if there's any backlog
   const hasBacklog = queue.totalPending > 0 || queue.totalFailed > 0;
   const hasStuck = queue.stuckCount > 0;
 
-  if (!hasBacklog && !hasStuck) {
+  if (!hasBacklog && !hasStuck && !retryFailed) {
     console.log('No backlog detected. Queue is healthy.\n');
 
     // Show recently processed if any
@@ -175,6 +232,16 @@ What is this for?
       console.log(`Recently processed: ${status.recentlyProcessed.length} messages in last 30 min\n`);
     }
     process.exit(0);
+  }
+
+  // After a retry, if there was nothing else pending originally and we just reset some,
+  // skip the "no backlog" exit and fall through to process
+  if (!hasBacklog && !hasStuck && retryFailed) {
+    if (autoProcess) {
+      console.log(`Auto-processing up to ${limit} sessions...\n`);
+    } else {
+      process.exit(0);
+    }
   }
 
   // Show details about pending messages

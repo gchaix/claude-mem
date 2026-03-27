@@ -144,3 +144,90 @@ describe('PendingMessageStore - Self-Healing claimNextMessage', () => {
     expect(session1Msg.status).toBe('processing');
   });
 });
+
+describe('PendingMessageStore - retryAllFailed', () => {
+  let db: Database;
+  let store: PendingMessageStore;
+  let sessionDbId: number;
+  const CONTENT_SESSION_ID = 'test-retry-failed';
+
+  beforeEach(() => {
+    db = new ClaudeMemDatabase(':memory:').db;
+    store = new PendingMessageStore(db, 3);
+    sessionDbId = createSDKSession(db, CONTENT_SESSION_ID, 'test-project', 'Test prompt');
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  function enqueueMessage(): number {
+    const message: PendingMessage = {
+      type: 'observation',
+      tool_name: 'TestTool',
+      tool_input: { test: 'input' },
+      tool_response: { test: 'response' },
+      prompt_number: 1,
+    };
+    return store.enqueue(sessionDbId, CONTENT_SESSION_ID, message);
+  }
+
+  function makeMessageFailed(messageId: number): void {
+    const now = Date.now();
+    db.run(
+      `UPDATE pending_messages SET status = 'failed', retry_count = 3, failed_at_epoch = ?, completed_at_epoch = ? WHERE id = ?`,
+      [now, now, messageId]
+    );
+  }
+
+  test('resets all failed messages to pending with retry_count=0', () => {
+    const id1 = enqueueMessage();
+    const id2 = enqueueMessage();
+    makeMessageFailed(id1);
+    makeMessageFailed(id2);
+
+    const count = store.retryAllFailed();
+    expect(count).toBe(2);
+
+    for (const id of [id1, id2]) {
+      const row = db.query('SELECT status, retry_count, started_processing_at_epoch, completed_at_epoch FROM pending_messages WHERE id = ?').get(id) as {
+        status: string;
+        retry_count: number;
+        started_processing_at_epoch: number | null;
+        completed_at_epoch: number | null;
+      };
+      expect(row.status).toBe('pending');
+      expect(row.retry_count).toBe(0);
+      expect(row.started_processing_at_epoch).toBeNull();
+      expect(row.completed_at_epoch).toBeNull();
+    }
+  });
+
+  test('does not affect pending or processing messages', () => {
+    const pendingId = enqueueMessage();
+    const processingId = enqueueMessage();
+    const failedId = enqueueMessage();
+
+    // Make one processing (recent, not stale)
+    db.run(
+      `UPDATE pending_messages SET status = 'processing', started_processing_at_epoch = ? WHERE id = ?`,
+      [Date.now(), processingId]
+    );
+    makeMessageFailed(failedId);
+
+    const count = store.retryAllFailed();
+    expect(count).toBe(1);
+
+    const pendingRow = db.query('SELECT status FROM pending_messages WHERE id = ?').get(pendingId) as { status: string };
+    expect(pendingRow.status).toBe('pending');
+
+    const processingRow = db.query('SELECT status FROM pending_messages WHERE id = ?').get(processingId) as { status: string };
+    expect(processingRow.status).toBe('processing');
+  });
+
+  test('returns 0 when no failed messages exist', () => {
+    enqueueMessage();
+    const count = store.retryAllFailed();
+    expect(count).toBe(0);
+  });
+});

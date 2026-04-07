@@ -167,6 +167,12 @@ async function buildHooks() {
       logLevel: 'error', // Suppress warnings (import.meta warning is benign)
       external: [
         'bun:sqlite',
+        // glob -> path-scurry -> lru-cache uses top-level await (ESM),
+        // which esbuild cannot bundle into CJS format. Externalize the
+        // entire chain; Bun resolves them from node_modules at runtime.
+        'glob',
+        'path-scurry',
+        'lru-cache',
         // Optional chromadb embedding providers
         'cohere-ai',
         'ollama',
@@ -212,6 +218,10 @@ async function buildHooks() {
         // Zod via @modelcontextprotocol/sdk; bundling it caused two Zod versions
         // to coexist at runtime and the v4 ↔ v3 _zod.def access crashed.
         'zod',
+        // glob -> path-scurry -> lru-cache uses top-level await (ESM)
+        'glob',
+        'path-scurry',
+        'lru-cache',
         'tree-sitter-cli',
         'tree-sitter-javascript',
         'tree-sitter-typescript',
@@ -301,7 +311,7 @@ async function buildHooks() {
       outfile: `${hooksDir}/${CONTEXT_GENERATOR.name}.cjs`,
       minify: true,
       logLevel: 'error',
-      external: ['bun:sqlite', 'zod'],
+      external: ['bun:sqlite', 'zod', 'glob', 'path-scurry', 'lru-cache'],
       define: {
         '__DEFAULT_PACKAGE_VERSION__': `"${version}"`
       },

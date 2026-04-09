@@ -782,11 +782,13 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const pendingStore = this.sessionManager.getPendingMessageStore();
     const queueLength = pendingStore.getPendingCount(sessionDbId);
+    const summarizeQueueLength = pendingStore.getPendingSummarizeCount(sessionDbId);
 
     res.json({
       status: 'active',
       sessionDbId,
       queueLength,
+      summarizeQueueLength,
       // Expose whether the last storage operation included a summary record.
       // The Stop hook uses this to detect silent summary loss when the queue empties (#1633).
       summaryStored: session.lastSummaryStored ?? null,

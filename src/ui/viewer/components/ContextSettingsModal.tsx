@@ -346,6 +346,7 @@ export function ContextSettingsModal({
                   <option value="claude">Claude (uses your Claude account)</option>
                   <option value="gemini">Gemini (uses API key)</option>
                   <option value="openrouter">OpenRouter (multi-model)</option>
+                  <option value="anthropic">Anthropic Proxy (uses API key or helper)</option>
                 </select>
               </FormField>
 
@@ -452,6 +453,55 @@ export function ContextSettingsModal({
                 </>
               )}
 
+              {formState.CLAUDE_MEM_PROVIDER === 'anthropic' && (
+                <>
+                  <FormField
+                    label="API Key"
+                    tooltip="Your Anthropic API key (or set CLAUDE_MEM_ANTHROPIC_API_KEY env var). Not needed if using a key helper."
+                  >
+                    <input
+                      type="password"
+                      value={formState.CLAUDE_MEM_ANTHROPIC_API_KEY || ''}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_ANTHROPIC_API_KEY', e.target.value)}
+                      placeholder="Enter API key (or use helper below)..."
+                    />
+                  </FormField>
+                  <FormField
+                    label="API Key Helper (Optional)"
+                    tooltip="Path to a script that returns an auth token (e.g., OAuth helper for corporate proxies)"
+                  >
+                    <input
+                      type="text"
+                      value={formState.CLAUDE_MEM_ANTHROPIC_API_KEY_HELPER || ''}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_ANTHROPIC_API_KEY_HELPER', e.target.value)}
+                      placeholder="/path/to/token-helper.sh"
+                    />
+                  </FormField>
+                  <FormField
+                    label="Base URL"
+                    tooltip="Anthropic API base URL. Override for corporate proxies or compatible gateways."
+                  >
+                    <input
+                      type="text"
+                      value={formState.CLAUDE_MEM_ANTHROPIC_BASE_URL || 'https://api.anthropic.com'}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_ANTHROPIC_BASE_URL', e.target.value)}
+                      placeholder="https://api.anthropic.com"
+                    />
+                  </FormField>
+                  <FormField
+                    label="Model"
+                    tooltip="Anthropic model identifier (check your proxy documentation for supported models)"
+                  >
+                    <input
+                      type="text"
+                      value={formState.CLAUDE_MEM_ANTHROPIC_MODEL || 'claude-sonnet-4-6'}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_ANTHROPIC_MODEL', e.target.value)}
+                      placeholder="claude-sonnet-4-6"
+                    />
+                  </FormField>
+                </>
+              )}
+
               <FormField
                 label="Worker Port"
                 tooltip="Port for the background worker service"
@@ -479,6 +529,16 @@ export function ContextSettingsModal({
                   description="Add previous session's final message"
                   checked={formState.CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE === 'true'}
                   onChange={() => toggleBoolean('CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE')}
+                />
+              </div>
+
+              <div className="toggle-group" style={{ marginTop: '12px' }}>
+                <ToggleSwitch
+                  id="allow-beta-sync"
+                  label="Allow beta sync"
+                  description="Allow build-and-sync to overwrite non-main branch installs"
+                  checked={formState.CLAUDE_MEM_ALLOW_BETA_SYNC === 'true'}
+                  onChange={() => toggleBoolean('CLAUDE_MEM_ALLOW_BETA_SYNC')}
                 />
               </div>
             </CollapsibleSection>

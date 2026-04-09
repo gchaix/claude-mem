@@ -312,6 +312,18 @@ export class PendingMessageStore {
   }
 
   /**
+   * Get count of pending summarize messages for a session
+   */
+  getPendingSummarizeCount(sessionDbId: number): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM pending_messages
+      WHERE session_db_id = ? AND status IN ('pending', 'processing') AND message_type = 'summarize'
+    `);
+    const result = stmt.get(sessionDbId) as { count: number };
+    return result.count;
+  }
+
+  /**
    * Peek at pending message types for a session (for tier routing).
    * Returns list of { message_type, tool_name } without claiming.
    */

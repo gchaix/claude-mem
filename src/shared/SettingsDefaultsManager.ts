@@ -37,6 +37,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_PYTHON_VERSION: string;
   CLAUDE_CODE_PATH: string;
   CLAUDE_MEM_MODE: string;
+  CLAUDE_MEM_ALLOW_BETA_SYNC: string;  // Allow sync-marketplace to overwrite beta branch installs
   // Token Economics
   CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: string;
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: string;
@@ -109,12 +110,22 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
     CLAUDE_MEM_OPENROUTER_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
+    CLAUDE_MEM_OPENROUTER_BATCH_SIZE: '4',  // Concurrent LLM requests per batch (match OLLAMA_NUM_PARALLEL)
+    // Anthropic Direct API Configuration
+    CLAUDE_MEM_ANTHROPIC_API_KEY: '',  // Static API key (or use API_KEY_HELPER for dynamic tokens)
+    CLAUDE_MEM_ANTHROPIC_API_KEY_HELPER: '',  // Path to script that returns an auth token (e.g., OAuth helper)
+    CLAUDE_MEM_ANTHROPIC_BASE_URL: 'https://api.anthropic.com',  // Override for corporate proxies
+    CLAUDE_MEM_ANTHROPIC_MODEL: 'claude-sonnet-4-6',  // Model ID (check your proxy docs for supported model names)
+    CLAUDE_MEM_ANTHROPIC_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
+    CLAUDE_MEM_ANTHROPIC_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
+    CLAUDE_MEM_ANTHROPIC_BATCH_SIZE: '8',  // Concurrent LLM requests per batch (Anthropic API handles high concurrency)
     // System Configuration
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
     CLAUDE_MEM_PYTHON_VERSION: '3.13',
     CLAUDE_CODE_PATH: '', // Empty means auto-detect via 'which claude'
     CLAUDE_MEM_MODE: 'code', // Default mode profile
+    CLAUDE_MEM_ALLOW_BETA_SYNC: 'false', // Allow sync-marketplace to overwrite beta branch installs
     // Token Economics
     CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS: 'false',
     CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS: 'false',

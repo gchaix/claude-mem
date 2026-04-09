@@ -139,7 +139,7 @@ export function getBranchInfo(): BranchInfo {
 
   // Determine branch state from git results
   const isDirty = status.length > 0;
-  const isBeta = branch.startsWith('beta');
+  const isBeta = branch !== 'main';
 
   return {
     branch,

@@ -125,6 +125,156 @@
 
 ---
 
+## Internal Fork
+
+> **This is an internal fork of [claude-mem](https://github.com/thedotmack/claude-mem)** on the `feat/proxy` branch. It adds an `AnthropicAgent` provider that routes observation processing through any Anthropic-compatible API proxy, bypassing the need for a local LLM or external API key.
+
+### What This Fork Adds
+
+- **AnthropicAgent** (`src/services/worker/AnthropicAgent.ts`) — A new AI provider that speaks the Anthropic Messages API directly via REST HTTP
+- **Dynamic token authentication** — Supports any script as an API key helper for OAuth-based auth via `CLAUDE_MEM_ANTHROPIC_API_KEY_HELPER`
+- **Proxy compatibility** — Configurable base URL and model names for any Anthropic-compatible proxy (corporate gateways, OpenWebUI, Bedrock, etc.)
+- **TLS certificate support** — `NODE_EXTRA_CA_CERTS` integration for corporate CA chains
+
+### Setup
+
+#### 1. Clone and install
+
+```bash
+git clone <your-repo-url> ~/repos/claude-mem
+cd ~/repos/claude-mem
+git checkout feat/proxy
+bun install
+```
+
+#### 2. Build
+
+```bash
+bun scripts/build-hooks.js
+```
+
+#### 3. Link as Claude Code plugin
+
+Replace the marketplace plugin with a symlink to your clone:
+
+```bash
+# Back up the existing marketplace install (if any)
+mv ~/.claude/plugins/marketplaces/thedotmack ~/.claude/plugins/marketplaces/thedotmack.marketplace
+
+# Symlink your fork
+ln -s ~/repos/claude-mem ~/.claude/plugins/marketplaces/thedotmack
+```
+
+#### 4. Configure settings
+
+Edit `~/.claude-mem/settings.json` and set the Anthropic provider:
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "anthropic",
+  "CLAUDE_MEM_ANTHROPIC_BASE_URL": "https://your-proxy.example.com/api/anthropic",
+  "CLAUDE_MEM_ANTHROPIC_MODEL": "claude-haiku-4-5-20251001",
+  "CLAUDE_MEM_ANTHROPIC_API_KEY": "<your-api-key>"
+}
+```
+
+**Authentication options** — choose one:
+
+- `CLAUDE_MEM_ANTHROPIC_API_KEY` — Static API key (simplest)
+- `CLAUDE_MEM_ANTHROPIC_API_KEY_HELPER` — Path to a script that outputs a token to stdout (for OAuth, rotating credentials, etc.)
+
+**Model names**: Use whatever model ID your proxy expects. Some proxies require fully-qualified IDs (e.g., `anthropic.claude-haiku-4-5-20251001-v1:0`), others accept short names (e.g., `haiku`). Check your proxy's documentation.
+
+Haiku is recommended for observation extraction — it's fast, cheap, and sufficient for this workload.
+
+#### 5. Configure launchd
+
+Edit `~/Library/LaunchAgents/com.claude-mem.worker.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-mem.worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/<you>/.bun/bin/bun</string>
+        <string>/Users/<you>/repos/claude-mem/plugin/scripts/worker-service.cjs</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/<you>/repos/claude-mem</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/<you>/.claude-mem/logs/worker-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/<you>/.claude-mem/logs/worker-stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/<you></string>
+        <key>PATH</key>
+        <string>/Users/<you>/.bun/bin:/Users/<you>/.nvm/versions/node/<version>/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>NODE_EXTRA_CA_CERTS</key>
+        <string>/path/to/your/ca-bundle.pem</string>
+    </dict>
+</dict>
+</plist>
+```
+
+The `NODE_EXTRA_CA_CERTS` line is only required if your proxy uses a corporate or self-signed CA chain. Remove it if connecting to a proxy with publicly-trusted certificates.
+
+#### 6. Start the worker
+
+```bash
+launchctl load -w ~/Library/LaunchAgents/com.claude-mem.worker.plist
+```
+
+#### 7. Verify
+
+```bash
+# Check worker is running
+curl -s http://localhost:37777/api/stats | python3 -m json.tool
+
+# Check logs for successful Anthropic calls
+tail -f ~/.claude-mem/logs/claude-mem-$(date +%Y-%m-%d).log | grep 'Anthropic API usage'
+```
+
+You should see lines like:
+```
+[INFO] [SDK] Anthropic API usage {model=claude-haiku-4-5-20251001, inputTokens=6224, outputTokens=41, totalTokens=6265, messagesInContext=15}
+```
+
+### Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `self signed certificate in certificate chain` | Missing CA bundle | Add `NODE_EXTRA_CA_CERTS` to the launchd plist pointing to your CA bundle |
+| `no accounts available can serve requests` | Wrong model name | Check your proxy's documentation for the correct model ID format |
+| `API key helper script returned empty output` | Token script issue | Run your helper script manually to verify it outputs a token |
+| `API key helper script timed out after 30s` | Keychain prompt or network issue | Run the script manually first to prime any credential caches |
+
+### Requeuing Failed Messages
+
+If messages failed while troubleshooting, reset them:
+
+```bash
+sqlite3 ~/.claude-mem/claude-mem.db "UPDATE pending_messages SET status = 'pending', started_processing_at_epoch = NULL, failed_at_epoch = NULL, retry_count = 0 WHERE status = 'failed';"
+curl -s -X POST http://localhost:37777/api/pending-queue/process
+```
+
+---
+
+## Upstream README
+
+> Everything below is from the upstream [thedotmack/claude-mem](https://github.com/thedotmack/claude-mem) project.
+
+---
+
 ## Quick Start
 
 Install with a single command:

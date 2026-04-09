@@ -9,7 +9,7 @@ set -euo pipefail
 #   # Or with options:
 #   curl -fsSL https://install.cmem.ai/openclaw.sh | bash -s -- --provider=gemini --api-key=YOUR_KEY
 #   # Direct execution:
-#   bash install.sh [--non-interactive] [--upgrade] [--provider=claude|gemini|openrouter] [--api-key=KEY]
+#   bash install.sh [--non-interactive] [--upgrade] [--provider=claude|gemini|openrouter|anthropic] [--api-key=KEY]
 
 ###############################################################################
 # Constants
@@ -1053,7 +1053,7 @@ setup_ai_provider() {
         ;;
       *)
         error "Unknown provider: ${CLI_PROVIDER}"
-        error "Valid providers: claude, gemini, openrouter"
+        error "Valid providers: claude, gemini, openrouter, anthropic"
         exit 1
         ;;
     esac

@@ -44,7 +44,19 @@ function getGitignoreExcludes(basePath) {
 const branch = getCurrentBranch();
 const isForce = process.argv.includes('--force');
 
-if (branch && branch !== 'main' && !isForce) {
+// Check settings for beta sync permission
+function isBetaSyncAllowed() {
+  try {
+    const settingsPath = path.join(os.homedir(), '.claude-mem', 'settings.json');
+    if (!existsSync(settingsPath)) return false;
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    return settings.CLAUDE_MEM_ALLOW_BETA_SYNC === 'true';
+  } catch {
+    return false;
+  }
+}
+
+if (branch && branch !== 'main' && !isForce && !isBetaSyncAllowed()) {
   console.log('');
   console.log('\x1b[33m%s\x1b[0m', `WARNING: Installed plugin is on beta branch: ${branch}`);
   console.log('\x1b[33m%s\x1b[0m', 'Running rsync would overwrite beta code.');

@@ -35,7 +35,7 @@ export class SessionManager {
   private getPendingStore(): PendingMessageStore {
     if (!this.pendingStore) {
       const sessionStore = this.dbManager.getSessionStore();
-      this.pendingStore = new PendingMessageStore(sessionStore.db, 3);
+      this.pendingStore = new PendingMessageStore(sessionStore.db, 5);
     }
     return this.pendingStore;
   }

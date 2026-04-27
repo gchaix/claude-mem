@@ -64,7 +64,7 @@ export class PendingMessageStore {
 
   /**
    * @param db                  SQLite database
-   * @param maxRetries          Per-message retry ceiling for transient SDK failures (default 3)
+   * @param maxRetries          Per-message retry ceiling for transient SDK failures (default 5)
    * @param workerPid           PID of the worker that owns this store; stamped into worker_pid on claim.
    *                            Defaults to process.pid so single-process deployments need no extra wiring.
    * @param getLiveWorkerPids   Provider for the set of all currently-live worker PIDs.
@@ -73,7 +73,7 @@ export class PendingMessageStore {
    */
   constructor(
     db: Database,
-    maxRetries: number = 3,
+    maxRetries: number = 5,
     workerPid: number = process.pid,
     getLiveWorkerPids?: LiveWorkerPidsProvider
   ) {
@@ -297,6 +297,20 @@ export class PendingMessageStore {
       `);
       stmt.run(now, messageId);
     }
+  }
+
+  /**
+   * Return message to pending without incrementing retry_count.
+   * Rate limits are recoverable waits, not structural failures —
+   * they should not consume retry budget.
+   */
+  markRateLimited(messageId: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending', worker_pid = NULL
+      WHERE id = ?
+    `);
+    stmt.run(messageId);
   }
 
   /**

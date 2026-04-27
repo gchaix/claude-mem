@@ -302,6 +302,18 @@ export class SDKAgent {
           // Usage telemetry is captured at SDK level
         }
       }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const lower = msg.toLowerCase();
+      if (lower.includes('rate limit') || lower.includes('rate_limit') || lower.includes('429')
+          || lower.includes('too many requests') || lower.includes('overloaded')) {
+        session.rateLimitHit = true;
+        logger.warn('SDK', `Rate limit error from SDK — flagging for backoff recovery`, {
+          sessionId: session.sessionDbId,
+          error: msg,
+        });
+      }
+      throw error;
     } finally {
       // Ensure subprocess is terminated after query completes (or on error).
       // Process-group teardown via ensureSdkProcessExit kills any descendants

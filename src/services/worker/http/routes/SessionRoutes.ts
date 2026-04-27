@@ -323,9 +323,13 @@ export class SessionRoutes extends BaseRouteHandler {
             }
 
             // Windowed restart guard: only blocks tight-loop restarts, not spread-out ones (#2053)
+            // Rate-limit restarts bypass the guard — they're recoverable waits, not crash loops.
             if (!session.restartGuard) session.restartGuard = new RestartGuard();
-            const restartAllowed = session.restartGuard.recordRestart();
-            session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1; // Keep for logging
+            const isRateLimitRecovery = !!session.rateLimitHit;
+            const restartAllowed = isRateLimitRecovery || session.restartGuard.recordRestart();
+            if (!isRateLimitRecovery) {
+              session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1; // Keep for logging
+            }
 
             if (!restartAllowed) {
               logger.error('SESSION', `CRITICAL: Restart guard tripped — session is dead, draining pending messages and terminating`, {
@@ -376,8 +380,23 @@ export class SessionRoutes extends BaseRouteHandler {
 
             this.crashRecoveryScheduled.add(sessionDbId);
 
-            // Exponential backoff: 1s, 2s, 4s for subsequent restarts
-            const backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveRestarts - 1), 8000);
+            // Rate-limit backoff: 30s → 60s → 120s → 300s cap.
+            // Normal crash backoff: 1s → 2s → 4s → 8s cap.
+            let backoffMs: number;
+            if (session.rateLimitHit) {
+              const rateLimitAttempt = (session.rateLimitBackoffMs ?? 0) > 0 ? Math.log2((session.rateLimitBackoffMs ?? 30_000) / 30_000) + 1 : 0;
+              backoffMs = Math.min(30_000 * Math.pow(2, rateLimitAttempt), 300_000);
+              session.rateLimitBackoffMs = backoffMs;
+              session.rateLimitHit = false;
+              logger.warn('SESSION', `Rate limit detected — backing off ${(backoffMs / 1000).toFixed(0)}s before restart`, {
+                sessionId: sessionDbId,
+                backoffMs,
+                pendingCount,
+              });
+            } else {
+              backoffMs = Math.min(1000 * Math.pow(2, session.consecutiveRestarts - 1), 8000);
+              session.rateLimitBackoffMs = undefined;
+            }
 
             // Delay before restart with exponential backoff
             setTimeout(() => {

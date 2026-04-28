@@ -10,6 +10,7 @@
  */
 
 import path from 'path';
+import { homedir } from 'os';
 import { existsSync } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -1305,6 +1306,20 @@ async function main() {
 
     case '--daemon':
     default: {
+      // Pin cwd to $HOME regardless of how the daemon was launched.
+      // spawnDaemon() already passes cwd: homedir(), but this protects against
+      // developer/operator paths that invoke --daemon directly from arbitrary
+      // shells. Without a known-good cwd, a later deletion of the inherited
+      // directory (worktree cleanup etc.) breaks every child_process call in
+      // the worker and surfaces as misleading "executable not found" errors.
+      try {
+        process.chdir(homedir());
+      } catch (err) {
+        // homedir() existing is a baseline assumption; if it somehow doesn't,
+        // log and continue — the daemon guards below will catch downstream failures.
+        logger.warn('SYSTEM', 'Failed to chdir to homedir at daemon start', {}, err as Error);
+      }
+
       // GUARD 1: Refuse to start if another worker is already alive.
       // Verifies PID *identity* (via start-time token) not just liveness, so a
       // stale PID file pointing at a PID that's since been reused by an

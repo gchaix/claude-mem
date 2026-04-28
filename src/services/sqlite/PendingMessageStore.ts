@@ -383,6 +383,43 @@ export class PendingMessageStore {
   /**
    * Convert a PersistentPendingMessage back to PendingMessage format
    */
+  /**
+   * Triage failed messages: requeue salvageable ones, delete the rest.
+   *
+   * Requeue: retry_count < maxRetries AND younger than maxAgeMs
+   * Delete:  retry_count >= maxRetries OR older than maxAgeMs
+   */
+  triageFailedMessages(maxAgeMs: number = 48 * 60 * 60 * 1000): { requeued: number; deleted: number } {
+    const cutoff = Date.now() - maxAgeMs;
+
+    // Requeue: under max retries AND recent enough to be worth processing
+    const requeueResult = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending', worker_pid = NULL
+      WHERE status = 'failed'
+        AND retry_count < ?
+        AND created_at_epoch > ?
+    `).run(this.maxRetries, cutoff);
+
+    // Delete: max retries exhausted OR too old
+    const deleteResult = this.db.prepare(`
+      DELETE FROM pending_messages
+      WHERE status = 'failed'
+        AND (retry_count >= ? OR created_at_epoch <= ?)
+    `).run(this.maxRetries, cutoff);
+
+    return { requeued: requeueResult.changes, deleted: deleteResult.changes };
+  }
+
+  getTotalPendingCount(): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM pending_messages
+      WHERE status IN ('pending', 'processing')
+    `);
+    const result = stmt.get() as { count: number };
+    return result.count;
+  }
+
   toPendingMessage(persistent: PersistentPendingMessage): PendingMessage {
     return {
       type: persistent.message_type,

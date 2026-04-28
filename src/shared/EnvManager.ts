@@ -13,6 +13,8 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'f
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
+import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from './paths.js';
 
 // Path to claude-mem's centralized .env file
 const DATA_DIR = join(homedir(), '.claude-mem');
@@ -257,6 +259,47 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
     }
   }
 
+  // 5. Inject Bedrock configuration from settings (if enabled)
+  // Settings are authoritative — they persist across daemon restarts regardless of
+  // which session spawned the worker. This is more reliable than depending on env var
+  // inheritance, since the daemon is long-lived and may be spawned by any session.
+  const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+  if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true') {
+    isolatedEnv.CLAUDE_CODE_USE_BEDROCK = '1';
+    if (settings.CLAUDE_MEM_BEDROCK_BASE_URL) {
+      isolatedEnv.ANTHROPIC_BEDROCK_BASE_URL = settings.CLAUDE_MEM_BEDROCK_BASE_URL;
+    }
+    if (settings.CLAUDE_MEM_BEDROCK_REGION) {
+      isolatedEnv.AWS_REGION = settings.CLAUDE_MEM_BEDROCK_REGION;
+    }
+    if (settings.CLAUDE_MEM_BEDROCK_MODEL) {
+      isolatedEnv.ANTHROPIC_MODEL = settings.CLAUDE_MEM_BEDROCK_MODEL;
+    }
+    let tokenLoaded = false;
+    if (settings.CLAUDE_MEM_BEDROCK_API_KEY_FILE) {
+      try {
+        const token = readFileSync(settings.CLAUDE_MEM_BEDROCK_API_KEY_FILE, 'utf-8').trim();
+        isolatedEnv.AWS_BEARER_TOKEN_BEDROCK = token;
+        isolatedEnv.ANTHROPIC_AUTH_TOKEN = token;
+        // Do NOT set ANTHROPIC_API_KEY alongside ANTHROPIC_AUTH_TOKEN — Claude Code
+        // treats having both as an auth conflict and warns on every startup.
+        tokenLoaded = true;
+      } catch (err) {
+        logger.warn('SYSTEM', 'Failed to read Bedrock API key file', {
+          path: settings.CLAUDE_MEM_BEDROCK_API_KEY_FILE
+        }, err as Error);
+      }
+    }
+    logger.info('SYSTEM', 'Bedrock mode active', {
+      baseUrl: settings.CLAUDE_MEM_BEDROCK_BASE_URL || '(default)',
+      region: settings.CLAUDE_MEM_BEDROCK_REGION || '(default)',
+      model: settings.CLAUDE_MEM_BEDROCK_MODEL || '(none)',
+      tokenLoaded,
+    });
+  } else {
+    logger.debug('SYSTEM', 'Bedrock mode disabled, using CLI auth');
+  }
+
   return isolatedEnv;
 }
 
@@ -284,6 +327,12 @@ export function hasAnthropicApiKey(): boolean {
 export function getAuthMethodDescription(): string {
   if (hasAnthropicApiKey()) {
     return 'API key (from ~/.claude-mem/.env)';
+  }
+  // Check if Bedrock is configured via settings
+  const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+  if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true') {
+    const base = settings.CLAUDE_MEM_BEDROCK_BASE_URL || 'AWS Bedrock';
+    return `Bedrock (${base})`;
   }
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     return 'Claude Code OAuth token (from parent process)';

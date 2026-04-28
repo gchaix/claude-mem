@@ -527,11 +527,16 @@ export class SDKAgent {
   }
 
   /**
-   * Get model ID from settings or environment
+   * Get model ID from settings or environment.
+   * When Bedrock is enabled, prefer the Bedrock model ID since the spawned CLI
+   * talks to Bedrock and only accepts Bedrock-format identifiers.
    */
   private getModelId(): string {
     const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
+    if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true' && settings.CLAUDE_MEM_BEDROCK_MODEL) {
+      return settings.CLAUDE_MEM_BEDROCK_MODEL;
+    }
     return settings.CLAUDE_MEM_MODEL;
   }
 }

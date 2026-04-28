@@ -28,6 +28,8 @@ import { getSdkProcessForSession, ensureSdkProcessExit } from '../../../../super
 import { getProjectContext } from '../../../../utils/project-name.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { RestartGuard } from '../../RestartGuard.js';
+import { isProjectExcluded } from '../../../../utils/project-filter.js';
+import { OBSERVER_SESSIONS_PROJECT } from '../../../../shared/paths.js';
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
 
@@ -834,6 +836,14 @@ export class SessionRoutes extends BaseRouteHandler {
     const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : undefined;
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const customTitle = req.body.customTitle || undefined;
+
+    // Server-side guard: reject observer-sessions before creating DB rows.
+    // The hook layer filters via shouldTrackProject(), but if the hook is
+    // outdated or the env var isn't set, this prevents queue flooding.
+    if (project === OBSERVER_SESSIONS_PROJECT) {
+      res.json({ skipped: true, reason: 'observer_session' });
+      return;
+    }
 
     // Filter on the raw prompt before truncation / [media prompt] substitution
     // so the check is independent of those transforms.

@@ -44,6 +44,38 @@ function fixBrokenScriptPath(argPath) {
 }
 
 /**
+ * Dev-mode path rewriting. When CLAUDE_MEM_DEV_ROOT points at a source checkout,
+ * map built .cjs artifacts under plugin/scripts/ to their TypeScript source
+ * equivalents so bun compiles them on the fly. Lets plugin developers iterate
+ * on src/ without running build-and-sync between edits. No-op when the env
+ * var is unset, and falls back to the original path if the TS source is
+ * missing (e.g. a renamed file in an in-progress refactor).
+ */
+const DEV_SOURCE_MAP = {
+  'scripts/worker-service.cjs': 'src/services/worker-service.ts',
+  'scripts/mcp-server.cjs': 'src/servers/mcp-server.ts',
+  'scripts/context-generator.cjs': 'src/services/context-generator.ts',
+};
+
+function rewriteToDevSource(argPath) {
+  const devRoot = process.env.CLAUDE_MEM_DEV_ROOT;
+  if (!devRoot) return argPath;
+  for (const [builtSuffix, sourceRelative] of Object.entries(DEV_SOURCE_MAP)) {
+    if (argPath.endsWith(builtSuffix)) {
+      const sourcePath = join(devRoot, sourceRelative);
+      if (existsSync(sourcePath)) {
+        return sourcePath;
+      }
+      // Source missing — log to stderr so the dev notices, but fall through
+      // to the built artifact rather than hard-failing the hook.
+      console.error(`[bun-runner] CLAUDE_MEM_DEV_ROOT set but source missing: ${sourcePath} — using built artifact`);
+      return argPath;
+    }
+  }
+  return argPath;
+}
+
+/**
  * Find Bun executable - checks PATH first, then common install locations
  */
 function findBun() {
@@ -122,6 +154,7 @@ if (args.length === 0) {
 
 // Fix broken script paths caused by empty CLAUDE_PLUGIN_ROOT (#1215)
 args[0] = fixBrokenScriptPath(args[0]);
+args[0] = rewriteToDevSource(args[0]);
 
 const bunPath = findBun();
 

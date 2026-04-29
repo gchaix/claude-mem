@@ -10,6 +10,7 @@
  */
 
 import path from 'path';
+import { homedir } from 'os';
 import { existsSync } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -439,17 +440,17 @@ export class WorkerService implements WorkerRef {
       logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
 
-      // One-shot GC for terminally-failed rows
+      // Triage failed messages: requeue salvageable ones, delete the rest
       try {
-        logger.info('WORKER', 'Running startup GC for pending messages...');
+        logger.info('WORKER', 'Running startup triage for failed pending messages...');
         const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
         const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
-        const cleared = pendingStore.clearFailedOlderThan(7 * 24 * 60 * 60 * 1000);
-        if (cleared > 0) {
-          logger.info('QUEUE', 'Startup GC cleared old failed pending_messages rows', { cleared });
+        const triage = pendingStore.triageFailedMessages();
+        if (triage.requeued > 0 || triage.deleted > 0) {
+          logger.info('QUEUE', 'Startup triage complete', triage);
         }
       } catch (err) {
-        logger.warn('QUEUE', 'Startup GC for failed pending_messages rows failed', {}, err instanceof Error ? err : undefined);
+        logger.warn('QUEUE', 'Startup triage for failed pending_messages failed', {}, err instanceof Error ? err : undefined);
       }
 
       // One-time v12.4.3 pollution cleanup. Runs AFTER migrations have applied
@@ -491,6 +492,16 @@ export class WorkerService implements WorkerRef {
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
       logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+
+      // Recover orphaned sessions that have pending messages from before this worker started
+      this.processPendingQueues().then(result => {
+        if (result.sessionsStarted > 0) {
+          logger.info('SYSTEM', 'Orphaned queue recovery complete', result);
+        }
+      }).catch(err => {
+        logger.error('SYSTEM', 'Orphaned queue recovery failed (non-blocking)', {},
+          err instanceof Error ? err : new Error(String(err)));
+      });
 
       await this.startTranscriptWatcher(settings);
 
@@ -1305,6 +1316,20 @@ async function main() {
 
     case '--daemon':
     default: {
+      // Pin cwd to $HOME regardless of how the daemon was launched.
+      // spawnDaemon() already passes cwd: homedir(), but this protects against
+      // developer/operator paths that invoke --daemon directly from arbitrary
+      // shells. Without a known-good cwd, a later deletion of the inherited
+      // directory (worktree cleanup etc.) breaks every child_process call in
+      // the worker and surfaces as misleading "executable not found" errors.
+      try {
+        process.chdir(homedir());
+      } catch (err) {
+        // homedir() existing is a baseline assumption; if it somehow doesn't,
+        // log and continue — the daemon guards below will catch downstream failures.
+        logger.warn('SYSTEM', 'Failed to chdir to homedir at daemon start', {}, err as Error);
+      }
+
       // GUARD 1: Refuse to start if another worker is already alive.
       // Verifies PID *identity* (via start-time token) not just liveness, so a
       // stale PID file pointing at a PID that's since been reused by an

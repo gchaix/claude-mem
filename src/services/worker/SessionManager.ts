@@ -17,6 +17,7 @@ import { SessionQueueProcessor } from '../queue/SessionQueueProcessor.js';
 import { getSdkProcessForSession, ensureSdkProcessExit } from '../../supervisor/process-registry.js';
 import { getSupervisor } from '../../supervisor/index.js';
 import { RestartGuard } from './RestartGuard.js';
+import { OBSERVER_SESSIONS_PROJECT } from '../../shared/paths.js';
 
 export class SessionManager {
   private dbManager: DatabaseManager;
@@ -35,7 +36,7 @@ export class SessionManager {
   private getPendingStore(): PendingMessageStore {
     if (!this.pendingStore) {
       const sessionStore = this.dbManager.getSessionStore();
-      this.pendingStore = new PendingMessageStore(sessionStore.db, 3);
+      this.pendingStore = new PendingMessageStore(sessionStore.db, 5);
     }
     return this.pendingStore;
   }
@@ -214,6 +215,10 @@ export class SessionManager {
       session = this.initializeSession(sessionDbId);
     }
 
+    if (session.project === OBSERVER_SESSIONS_PROJECT) {
+      return;
+    }
+
     // CRITICAL: Persist to database FIRST
     const message: PendingMessage = {
       type: 'observation',
@@ -277,6 +282,10 @@ export class SessionManager {
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
+    }
+
+    if (session.project === OBSERVER_SESSIONS_PROJECT) {
+      return;
     }
 
     // PATHFINDER plan 03 phase 3: summary-failure circuit breaker deleted.
@@ -439,15 +448,12 @@ export class SessionManager {
   }
 
   /**
-   * Get total queue depth across all sessions (for activity indicator)
+   * Get total queue depth across ALL sessions (for activity indicator).
+   * Queries the database directly so orphaned messages from sessions not
+   * currently in the in-memory map are still counted.
    */
   getTotalQueueDepth(): number {
-    let total = 0;
-    // We can iterate over active sessions to get their pending count
-    for (const session of this.sessions.values()) {
-      total += this.getPendingStore().getPendingCount(session.sessionDbId);
-    }
-    return total;
+    return this.getPendingStore().getTotalPendingCount();
   }
 
   /**
@@ -460,12 +466,44 @@ export class SessionManager {
   }
 
   /**
-   * Check if any active session has pending work.
-   * Scoped to in-memory sessions only — orphaned DB messages from dead
-   * sessions must not keep the spinner spinning forever.
+   * Check if any session has pending work (including orphaned DB messages).
    */
   isAnySessionProcessing(): boolean {
     return this.getTotalQueueDepth() > 0;
+  }
+
+  /**
+   * Find sessions with pending messages that aren't in the in-memory map
+   * and initialize them so they become visible to the processing pipeline.
+   * Returns the list of session IDs that were hydrated.
+   */
+  hydrateOrphanedSessions(): number[] {
+    const dbSessionIds = this.getPendingStore().getSessionsWithPendingMessages();
+    const hydrated: number[] = [];
+
+    for (const sessionDbId of dbSessionIds) {
+      if (this.sessions.has(sessionDbId)) continue;
+
+      try {
+        this.initializeSession(sessionDbId);
+        hydrated.push(sessionDbId);
+        logger.info('SESSION', 'Hydrated orphaned session from DB', {
+          sessionDbId,
+          pendingCount: this.getPendingStore().getPendingCount(sessionDbId)
+        });
+      } catch (error) {
+        logger.warn('SESSION', `Failed to hydrate orphaned session ${sessionDbId}`, {},
+          error instanceof Error ? error : undefined);
+      }
+    }
+
+    if (hydrated.length > 0) {
+      logger.info('SESSION', `Hydrated ${hydrated.length} orphaned sessions`, {
+        sessionIds: hydrated
+      });
+    }
+
+    return hydrated;
   }
 
   /**

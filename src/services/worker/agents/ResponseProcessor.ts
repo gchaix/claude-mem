@@ -27,6 +27,18 @@ import type { WorkerRef, StorageResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
 import { cleanupProcessedMessages } from './SessionCleanupHelper.js';
 
+const RATE_LIMIT_PATTERNS = [
+  'rate limit',
+  'rate_limit',
+  'too many requests',
+  '429',
+  'overloaded_error',
+  'overloaded',
+  'throttl',
+  'Request too large',
+  'capacity',
+] as const;
+
 /**
  * Process agent response text (parse XML, save to database, sync to Chroma, broadcast SSE)
  *
@@ -74,12 +86,25 @@ export async function processAgentResponse(
   const parsed = parseAgentXml(text, session.contentSessionId);
 
   if (!parsed.valid) {
-    logger.warn('PARSER', `${agentName} returned unparseable response: ${parsed.reason}`, {
-      sessionId: session.sessionDbId,
-    });
     const pendingStore = sessionManager.getPendingMessageStore();
-    for (const messageId of session.processingMessageIds) {
-      pendingStore.markFailed(messageId);
+    const lowerReason = parsed.reason.toLowerCase();
+    const isRateLimit = RATE_LIMIT_PATTERNS.some(p => lowerReason.includes(p.toLowerCase()));
+
+    if (isRateLimit) {
+      logger.warn('PARSER', `${agentName} returned rate-limit response — messages preserved without retry penalty: ${parsed.reason}`, {
+        sessionId: session.sessionDbId,
+      });
+      for (const messageId of session.processingMessageIds) {
+        pendingStore.markRateLimited(messageId);
+      }
+      session.rateLimitHit = true;
+    } else {
+      logger.warn('PARSER', `${agentName} returned unparseable response: ${parsed.reason}`, {
+        sessionId: session.sessionDbId,
+      });
+      for (const messageId of session.processingMessageIds) {
+        pendingStore.markFailed(messageId);
+      }
     }
     session.processingMessageIds = [];
     return;

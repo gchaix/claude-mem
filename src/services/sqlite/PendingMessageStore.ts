@@ -64,7 +64,7 @@ export class PendingMessageStore {
 
   /**
    * @param db                  SQLite database
-   * @param maxRetries          Per-message retry ceiling for transient SDK failures (default 3)
+   * @param maxRetries          Per-message retry ceiling for transient SDK failures (default 5)
    * @param workerPid           PID of the worker that owns this store; stamped into worker_pid on claim.
    *                            Defaults to process.pid so single-process deployments need no extra wiring.
    * @param getLiveWorkerPids   Provider for the set of all currently-live worker PIDs.
@@ -73,7 +73,7 @@ export class PendingMessageStore {
    */
   constructor(
     db: Database,
-    maxRetries: number = 3,
+    maxRetries: number = 5,
     workerPid: number = process.pid,
     getLiveWorkerPids?: LiveWorkerPidsProvider
   ) {
@@ -300,6 +300,20 @@ export class PendingMessageStore {
   }
 
   /**
+   * Return message to pending without incrementing retry_count.
+   * Rate limits are recoverable waits, not structural failures —
+   * they should not consume retry budget.
+   */
+  markRateLimited(messageId: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending', worker_pid = NULL
+      WHERE id = ?
+    `);
+    stmt.run(messageId);
+  }
+
+  /**
    * Get count of pending messages for a session
    */
   getPendingCount(sessionDbId: number): number {
@@ -369,6 +383,43 @@ export class PendingMessageStore {
   /**
    * Convert a PersistentPendingMessage back to PendingMessage format
    */
+  /**
+   * Triage failed messages: requeue salvageable ones, delete the rest.
+   *
+   * Requeue: retry_count < maxRetries AND younger than maxAgeMs
+   * Delete:  retry_count >= maxRetries OR older than maxAgeMs
+   */
+  triageFailedMessages(maxAgeMs: number = 48 * 60 * 60 * 1000): { requeued: number; deleted: number } {
+    const cutoff = Date.now() - maxAgeMs;
+
+    // Requeue: under max retries AND recent enough to be worth processing
+    const requeueResult = this.db.prepare(`
+      UPDATE pending_messages
+      SET status = 'pending', worker_pid = NULL
+      WHERE status = 'failed'
+        AND retry_count < ?
+        AND created_at_epoch > ?
+    `).run(this.maxRetries, cutoff);
+
+    // Delete: max retries exhausted OR too old
+    const deleteResult = this.db.prepare(`
+      DELETE FROM pending_messages
+      WHERE status = 'failed'
+        AND (retry_count >= ? OR created_at_epoch <= ?)
+    `).run(this.maxRetries, cutoff);
+
+    return { requeued: requeueResult.changes, deleted: deleteResult.changes };
+  }
+
+  getTotalPendingCount(): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count FROM pending_messages
+      WHERE status IN ('pending', 'processing')
+    `);
+    const result = stmt.get() as { count: number };
+    return result.count;
+  }
+
   toPendingMessage(persistent: PersistentPendingMessage): PendingMessage {
     return {
       type: persistent.message_type,

@@ -354,6 +354,12 @@ export class GeminiAgent {
       throw error;
     }
 
+    const msg = error instanceof Error ? error.message : String(error);
+    const lower = msg.toLowerCase();
+    if (lower.includes('rate limit') || lower.includes('rate_limit') || lower.includes('429')
+        || lower.includes('too many requests') || lower.includes('overloaded')) {
+      session.rateLimitHit = true;
+    }
     logger.failure('SDK', 'Gemini agent error', { sessionDbId: session.sessionDbId }, error instanceof Error ? error : new Error(String(error)));
     throw error;
   }

@@ -53,6 +53,10 @@ export interface ActiveSession {
   // so subagent work is attributable. NULL / undefined means the batch came from the main session.
   pendingAgentId?: string | null;
   pendingAgentType?: string | null;
+  // Set by ResponseProcessor when a rate-limit response is detected.
+  // SessionRoutes crash recovery reads this to apply backoff delay before restart.
+  rateLimitHit?: boolean;
+  rateLimitBackoffMs?: number;
 }
 
 export interface PendingMessage {

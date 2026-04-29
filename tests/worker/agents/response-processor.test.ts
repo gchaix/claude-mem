@@ -816,4 +816,58 @@ describe('ResponseProcessor', () => {
       expect(session.consecutiveSummaryFailures).toBe(0);
     });
   });
+
+  describe('rate-limit detection', () => {
+    let mockMarkFailed: ReturnType<typeof mock>;
+    let mockMarkRateLimited: ReturnType<typeof mock>;
+
+    beforeEach(() => {
+      mockMarkFailed = mock(() => {});
+      mockMarkRateLimited = mock(() => {});
+      mockSessionManager = {
+        getMessageIterator: async function* () { yield* []; },
+        getPendingMessageStore: () => ({
+          markProcessed: mock(() => {}),
+          confirmProcessed: mock(() => {}),
+          cleanupProcessed: mock(() => 0),
+          resetStuckMessages: mock(() => 0),
+          markFailed: mockMarkFailed,
+          markRateLimited: mockMarkRateLimited,
+        }),
+      } as unknown as SessionManager;
+    });
+
+    it('should call markRateLimited when response contains rate limit text', async () => {
+      const session = createMockSession({ processingMessageIds: [101, 102] });
+      const rateLimitResponse = 'Error: 429 Too Many Requests - rate limit exceeded';
+
+      await processAgentResponse(rateLimitResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+
+      expect(mockMarkRateLimited).toHaveBeenCalledTimes(2);
+      expect(mockMarkFailed).toHaveBeenCalledTimes(0);
+      expect(session.rateLimitHit).toBe(true);
+      expect(session.processingMessageIds).toEqual([]);
+    });
+
+    it('should call markFailed for non-rate-limit unparseable responses', async () => {
+      const session = createMockSession({ processingMessageIds: [101] });
+      const garbageResponse = 'I am a helpful assistant! Here are my thoughts...';
+
+      await processAgentResponse(garbageResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+
+      expect(mockMarkFailed).toHaveBeenCalledTimes(1);
+      expect(mockMarkRateLimited).toHaveBeenCalledTimes(0);
+      expect(session.rateLimitHit).toBeUndefined();
+    });
+
+    it('should detect overloaded_error pattern', async () => {
+      const session = createMockSession({ processingMessageIds: [101] });
+      const overloadedResponse = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+
+      await processAgentResponse(overloadedResponse, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
+
+      expect(mockMarkRateLimited).toHaveBeenCalledTimes(1);
+      expect(session.rateLimitHit).toBe(true);
+    });
+  });
 });

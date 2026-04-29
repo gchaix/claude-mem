@@ -44,6 +44,38 @@ function fixBrokenScriptPath(argPath) {
 }
 
 /**
+ * Dev-mode path rewriting. When CLAUDE_MEM_DEV_ROOT points at a source checkout,
+ * map built .cjs artifacts under plugin/scripts/ to their TypeScript source
+ * equivalents so bun compiles them on the fly. Lets plugin developers iterate
+ * on src/ without running build-and-sync between edits. No-op when the env
+ * var is unset, and falls back to the original path if the TS source is
+ * missing (e.g. a renamed file in an in-progress refactor).
+ */
+const DEV_SOURCE_MAP = {
+  'scripts/worker-service.cjs': 'src/services/worker-service.ts',
+  'scripts/mcp-server.cjs': 'src/servers/mcp-server.ts',
+  'scripts/context-generator.cjs': 'src/services/context-generator.ts',
+};
+
+function rewriteToDevSource(argPath) {
+  const devRoot = process.env.CLAUDE_MEM_DEV_ROOT;
+  if (!devRoot) return argPath;
+  for (const [builtSuffix, sourceRelative] of Object.entries(DEV_SOURCE_MAP)) {
+    if (argPath.endsWith(builtSuffix)) {
+      const sourcePath = join(devRoot, sourceRelative);
+      if (existsSync(sourcePath)) {
+        return sourcePath;
+      }
+      // Source missing — log to stderr so the dev notices, but fall through
+      // to the built artifact rather than hard-failing the hook.
+      console.error(`[bun-runner] CLAUDE_MEM_DEV_ROOT set but source missing: ${sourcePath} — using built artifact`);
+      return argPath;
+    }
+  }
+  return argPath;
+}
+
+/**
  * Find Bun executable - checks PATH first, then common install locations
  */
 function findBun() {
@@ -122,6 +154,7 @@ if (args.length === 0) {
 
 // Fix broken script paths caused by empty CLAUDE_PLUGIN_ROOT (#1215)
 args[0] = fixBrokenScriptPath(args[0]);
+args[0] = rewriteToDevSource(args[0]);
 
 const bunPath = findBun();
 
@@ -130,6 +163,10 @@ if (!bunPath) {
   console.error('After installation, restart your terminal.');
   process.exit(1);
 }
+
+// MCP servers need a persistent bidirectional stdio pipe for JSON-RPC.
+// Hooks get a single JSON blob on stdin then EOF. Detect which mode we need.
+const isMcpServer = args[0].endsWith('mcp-server.cjs') || args[0].endsWith('mcp-server.ts');
 
 // Fix #646: Buffer stdin in Node.js before passing to Bun.
 // On Linux, Bun's libuv calls fstat() on inherited pipe fds and crashes with
@@ -163,14 +200,10 @@ function collectStdin() {
   });
 }
 
-const stdinData = await collectStdin();
-
-// Spawn Bun with the provided script and args
-// Use spawn (not spawnSync) to properly handle stdio
-// On Windows, use cmd.exe to execute bun.cmd since npm-installed bun is a batch file
-// Use windowsHide to prevent a visible console window from spawning on Windows
+// MCP servers need bidirectional stdio for JSON-RPC — inherit fds directly.
+// Hooks need the stdin-buffer workaround for Bun's fstat issue (#646).
 const spawnOptions = {
-  stdio: ['pipe', 'inherit', 'inherit'],
+  stdio: isMcpServer ? ['inherit', 'inherit', 'inherit'] : ['pipe', 'inherit', 'inherit'],
   windowsHide: true,
   env: process.env
 };
@@ -184,15 +217,22 @@ if (IS_WINDOWS) {
   spawnArgs = ['/c', bunPath, ...args];
 }
 
+let stdinData = null;
+if (!isMcpServer) {
+  stdinData = await collectStdin();
+}
+
 const child = spawn(spawnCmd, spawnArgs, spawnOptions);
 
-// Write buffered stdin to child's pipe, then close it so the child sees EOF.
-// Fall back to '{}' when no stdin data is available so worker-service.cjs
-// always receives valid JSON input even when Claude Code doesn't pipe stdin
-// (e.g. during SessionStart on some platforms). Fixes #1560.
-if (child.stdin) {
-  child.stdin.write(stdinData || '{}');
-  child.stdin.end();
+if (!isMcpServer) {
+  // One-shot hook: write buffered stdin then close.
+  // Fall back to '{}' when no stdin data is available so worker-service.cjs
+  // always receives valid JSON input even when Claude Code doesn't pipe stdin
+  // (e.g. during SessionStart on some platforms). Fixes #1560.
+  if (child.stdin) {
+    child.stdin.write(stdinData || '{}');
+    child.stdin.end();
+  }
 }
 
 child.on('error', (err) => {

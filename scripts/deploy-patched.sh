@@ -127,6 +127,38 @@ else
   fi
 fi
 
+# --- Mirror into upstream-version dir ---------------------------------------
+# When our declared version carries a fork suffix (e.g. 13.2.0-tag1.1), Claude
+# Code's plugin-install machinery will still materialize a dir for the bare
+# upstream version (e.g. 13.2.0/) and set CLAUDE_PLUGIN_ROOT to it for
+# sessions that loaded before our transition landed. Mirror our patched
+# content into that dir too so hooks resolving via CLAUDE_PLUGIN_ROOT find
+# patched code, not stock upstream.
+#
+# Preserves Claude-Code-managed metadata (.in_use/, .orphaned_at,
+# .install-version) by excluding them from the sync.
+
+UPSTREAM_VERSION="${VERSION%-tag*}"
+if [[ "${UPSTREAM_VERSION}" != "${VERSION}" ]]; then
+  UPSTREAM_DIR="${CACHE_BASE}/${UPSTREAM_VERSION}"
+  echo
+  echo "==> Mirroring patched bundle → ${UPSTREAM_DIR} (for CLAUDE_PLUGIN_ROOT compatibility)"
+  if [[ -e "${UPSTREAM_DIR}" && ! -d "${UPSTREAM_DIR}" ]]; then
+    echo "    WARNING: ${UPSTREAM_DIR} exists and is not a directory — skipping mirror" >&2
+  else
+    if [[ ! -d "${UPSTREAM_DIR}" ]]; then
+      run "mkdir -p '${UPSTREAM_DIR}'"
+    fi
+    # No --delete: preserves .in_use/, .orphaned_at, .install-version etc.
+    run "rsync -a \
+      --exclude='.git' \
+      --exclude='.in_use/' \
+      --exclude='.orphaned_at' \
+      --exclude='.install-version' \
+      '${CACHE_DIR}/' '${UPSTREAM_DIR}/'"
+  fi
+fi
+
 # --- Version-transition steps (only if installed version is changing) -------
 
 if (( IS_TRANSITION )) || [[ -z "${CURRENT_INSTALLED_VERSION}" ]]; then
@@ -177,13 +209,24 @@ if (( IS_TRANSITION )) || [[ -z "${CURRENT_INSTALLED_VERSION}" ]]; then
   fi
 
   # --- Clean up old cache dir ----------------------------------------------
+  # NOTE: Claude Code sessions loaded before this transition keep
+  # CLAUDE_PLUGIN_ROOT pointing at the OLD cache dir. Deleting it would make
+  # their hooks 404. We previously ran with a global --keep-old default; now
+  # we replace the old dir with a symlink to the new one so stale references
+  # resolve instead of breaking. Skipped entirely with --keep-old for users
+  # who want to keep old dirs intact (e.g. for rollback testing).
   if (( IS_TRANSITION )) && (( ! KEEP_OLD )); then
     OLD_DIR="${CACHE_BASE}/${CURRENT_INSTALLED_VERSION}"
-    if [[ -d "${OLD_DIR}" ]]; then
+    if [[ -d "${OLD_DIR}" && ! -L "${OLD_DIR}" ]]; then
       echo
-      echo "==> Removing old cache dir: ${OLD_DIR}"
-      echo "    (use --keep-old to skip this step)"
+      echo "==> Replacing old cache dir with symlink: ${OLD_DIR} → ${VERSION}"
+      echo "    (use --keep-old to preserve the old dir as a full copy)"
+      # Mirror any Claude-Code metadata markers out first, then remove dir
+      # contents, then symlink. We do NOT attempt to preserve .in_use markers
+      # here because the old dir's PIDs reference sessions whose PLUGIN_ROOT
+      # is baked at startup — a symlink replacement is transparent to them.
       run "rm -rf '${OLD_DIR}'"
+      run "ln -s '${VERSION}' '${OLD_DIR}'"
     fi
   fi
 fi
@@ -216,7 +259,10 @@ echo "==> Deploy complete."
 if (( IS_TRANSITION )); then
   echo "    transitioned ${CURRENT_INSTALLED_VERSION} → ${VERSION}"
   if (( ! KEEP_OLD )); then
-    echo "    old cache dir removed"
+    echo "    old cache dir symlinked to ${VERSION} (use --keep-old to preserve old copy)"
   fi
   echo "    installed_plugins.json backup: ${INSTALLED_PLUGINS}.pre-${VERSION}.bak"
+fi
+if [[ "${UPSTREAM_VERSION}" != "${VERSION}" ]]; then
+  echo "    mirrored patched bundle into ${CACHE_BASE}/${UPSTREAM_VERSION} for CLAUDE_PLUGIN_ROOT compat"
 fi

@@ -34,8 +34,17 @@ export interface ActiveSession {
   lastSummaryStored?: boolean;
   pendingAgentId?: string | null;
   pendingAgentType?: string | null;
-  abortReason?: 'idle' | 'shutdown' | 'overflow' | 'restart-guard' | 'quota' | string | null;
+  abortReason?: 'idle' | 'shutdown' | 'overflow' | 'restart-guard' | 'quota' | 'rate-limit' | string | null;
   respawnTimer?: ReturnType<typeof setTimeout>;
+  // Rate-limit resilience: when the generator exits because the provider is
+  // rate-limited or transiently overloaded, we want a longer, guard-bypassing
+  // backoff that preserves pending work. retryAfterMs carries the provider's
+  // Retry-After hint when one was supplied; rateLimitBackoffCount is the number
+  // of consecutive rate-limit restarts since the last successful processing,
+  // used to compute an exponential schedule (30s → 60s → 120s → 300s cap) when
+  // retryAfterMs is absent. Both reset to zero on the next successful run.
+  retryAfterMs?: number;
+  rateLimitBackoffCount?: number;
 }
 
 export interface PendingMessage {

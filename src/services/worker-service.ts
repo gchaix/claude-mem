@@ -1,5 +1,6 @@
 
 import path from 'path';
+import { homedir } from 'os';
 import { existsSync } from 'fs';
 import { spawn } from 'child_process';
 import { Database } from 'bun:sqlite';
@@ -364,6 +365,35 @@ export class WorkerService implements WorkerRef {
         logger.info('SYSTEM', `Startup orphan sweep reclaimed ${sweepResult.changes} processing rows`);
       }
 
+      // Triage 'failed' messages left over from previous worker lifetimes.
+      // Anything still under the retry ceiling and within the 48h salvage
+      // window is requeued to 'pending'; the rest is deleted. This also
+      // covers rows quarantined by the new markFailed path (Phase 3).
+      // 'failed' status only exists once migration 35 has applied; on
+      // databases that haven't seen it yet this query is a no-op.
+      try {
+        const triageRequeued = this.dbManager.getSessionStore().db.prepare(`
+          UPDATE pending_messages
+             SET status = 'pending',
+                 completed_at_epoch = NULL
+           WHERE status = 'failed'
+             AND retry_count < 5
+             AND created_at_epoch >= ?
+        `).run(Date.now() - 48 * 60 * 60 * 1000);
+
+        const triageDeleted = this.dbManager.getSessionStore().db.prepare(`
+          DELETE FROM pending_messages WHERE status = 'failed'
+        `).run();
+
+        if (triageRequeued.changes > 0 || triageDeleted.changes > 0) {
+          logger.info('SYSTEM', `Startup failed-message triage: requeued=${triageRequeued.changes} deleted=${triageDeleted.changes}`);
+        }
+      } catch (err) {
+        // Expected on databases that haven't yet applied migration 35 —
+        // the status CHECK constraint will reject 'failed'. Silent skip.
+        logger.debug('SYSTEM', 'Failed-message triage skipped (schema pre-35)', {}, err instanceof Error ? err : new Error(String(err)));
+      }
+
       runOneTimeV12_4_3Cleanup();
 
       logger.info('WORKER', 'Initializing search services...');
@@ -398,6 +428,25 @@ export class WorkerService implements WorkerRef {
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
       logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+
+      // Orphan hydration: discover sessions whose pending_messages survived
+      // a worker crash/restart but whose ActiveSession was never re-created
+      // (because no hook fired to trigger getOrCreateSession). Without this,
+      // orphaned queues sit in the DB invisible to getTotalQueueDepth() and
+      // the UI, with nothing ever draining them.
+      try {
+        const hydratedIds = await this.sessionManager.hydrateOrphanedSessions();
+        for (const sid of hydratedIds) {
+          const session = this.sessionManager.getSession(sid);
+          if (session && !session.generatorPromise) {
+            this.startSessionProcessor(session, 'orphan-hydration');
+          }
+        }
+      } catch (err) {
+        logger.error('SYSTEM', 'Orphan session hydration failed (non-fatal)', {},
+          err instanceof Error ? err : new Error(String(err))
+        );
+      }
 
       await this.startTranscriptWatcher(settings);
 
@@ -602,6 +651,33 @@ export class WorkerService implements WorkerRef {
             errorKind: dispatchKind,
             errorMessage
           });
+          return;
+        }
+
+        // Rate-limit / transient provider errors: treat as soft backoff, not a
+        // failure. Flag the session so GeneratorExitHandler uses an extended
+        // backoff schedule, preserves pending work, and bypasses the restart
+        // guard's consecutive-failure counter. Without this path, a sustained
+        // 429 window drains the 5-restart budget and clears all pending
+        // observations.
+        if (dispatchKind === 'rate_limit' || dispatchKind === 'transient') {
+          session.abortReason = 'rate-limit';
+          if (classified?.retryAfterMs !== undefined) {
+            session.retryAfterMs = classified.retryAfterMs;
+          }
+          logger.warn('SDK', `Rate-limited by provider — will back off and retry`, {
+            sessionId: session.sessionDbId,
+            project: session.project,
+            errorKind: dispatchKind,
+            retryAfterMs: classified?.retryAfterMs,
+            errorMessage
+          });
+          this.lastAiInteraction = {
+            timestamp: Date.now(),
+            success: false,
+            provider: providerName,
+            error: errorMessage,
+          };
           return;
         }
 
@@ -1159,6 +1235,18 @@ async function main() {
 
     case '--daemon':
     default: {
+      // Pin cwd to $HOME regardless of how the daemon was launched.
+      // spawnDaemon() already passes cwd: homedir(), but this protects against
+      // developer/operator paths that invoke --daemon directly from arbitrary
+      // shells. Without a known-good cwd, a later deletion of the inherited
+      // directory (worktree cleanup etc.) breaks every child_process call in
+      // the worker and surfaces as misleading "executable not found" errors.
+      try {
+        process.chdir(homedir());
+      } catch (err) {
+        logger.warn('SYSTEM', 'Failed to chdir to homedir at daemon start', {}, err instanceof Error ? err : new Error(String(err)));
+      }
+
       const existingPidInfo = readPidFile();
       if (verifyPidFileOwnership(existingPidInfo)) {
         logger.info('SYSTEM', 'Worker already running (PID alive), refusing to start duplicate', {

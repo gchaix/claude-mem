@@ -22,6 +22,12 @@ export interface SettingsDefaults {
   CLAUDE_MEM_OPENROUTER_APP_NAME: string;
   CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: string;
   CLAUDE_MEM_OPENROUTER_MAX_TOKENS: string;
+  // Bedrock Provider Configuration (for corporate Bedrock proxies)
+  CLAUDE_MEM_BEDROCK_ENABLED: string;         // 'true' | 'false' - enable Bedrock mode for Claude SDK agent
+  CLAUDE_MEM_BEDROCK_BASE_URL: string;        // Bedrock endpoint (e.g. 'https://openwebui-proxy.tag1.io/bedrock')
+  CLAUDE_MEM_BEDROCK_REGION: string;          // AWS region (e.g. 'us-west-2')
+  CLAUDE_MEM_BEDROCK_MODEL: string;           // Bedrock model ID (e.g. 'global.anthropic.claude-sonnet-4-6-v1')
+  CLAUDE_MEM_BEDROCK_API_KEY_FILE: string;    // Path to file containing bearer token for Bedrock proxy auth
   CLAUDE_MEM_DATA_DIR: string;
   CLAUDE_MEM_LOG_LEVEL: string;
   CLAUDE_MEM_PYTHON_VERSION: string;
@@ -97,6 +103,12 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
     CLAUDE_MEM_OPENROUTER_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
+    // Bedrock Provider Configuration (for corporate Bedrock proxies)
+    CLAUDE_MEM_BEDROCK_ENABLED: 'false',        // Disabled by default
+    CLAUDE_MEM_BEDROCK_BASE_URL: '',            // No default — must be set explicitly
+    CLAUDE_MEM_BEDROCK_REGION: 'us-west-2',     // Default AWS region
+    CLAUDE_MEM_BEDROCK_MODEL: '',               // No default — must be set explicitly
+    CLAUDE_MEM_BEDROCK_API_KEY_FILE: '',        // No default — must be set explicitly
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
     CLAUDE_MEM_PYTHON_VERSION: '3.13',

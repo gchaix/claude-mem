@@ -299,6 +299,60 @@ export class SessionManager {
     return await this.getQueueEngine().resetProcessingToPending(sessionDbId);
   }
 
+  /**
+   * Discover session rows that have pending_messages in the DB but aren't in
+   * the in-memory session map, and instantiate an ActiveSession for each.
+   * Called once at worker startup so orphaned queues (from crashed workers,
+   * directory deletions, worker restarts across Claude Code sessions) get
+   * picked up instead of sitting forever in the DB.
+   *
+   * Does NOT start generators — the caller is expected to iterate the
+   * returned session IDs and dispatch them through the normal generator-
+   * start path. This separation keeps SessionManager decoupled from
+   * provider selection.
+   *
+   * Only runs on the SQLite queue engine path; BullMQ runtimes manage
+   * their own lifecycle via durable job IDs and don't need this.
+   */
+  async hydrateOrphanedSessions(): Promise<number[]> {
+    if (this.queueEngineName === 'bullmq') return [];
+
+    const sessionStore = this.dbManager.getSessionStore();
+    const rows = sessionStore.db.prepare(`
+      SELECT DISTINCT session_db_id
+        FROM pending_messages
+       WHERE status IN ('pending', 'processing')
+       ORDER BY session_db_id ASC
+    `).all() as Array<{ session_db_id: number }>;
+
+    const hydrated: number[] = [];
+    for (const row of rows) {
+      if (this.sessions.has(row.session_db_id)) continue;
+      try {
+        const dbSession = this.dbManager.getSessionById(row.session_db_id);
+        if (!dbSession) {
+          logger.warn('SESSION', 'Orphaned pending_messages reference missing sdk_sessions row — skipping', {
+            sessionId: row.session_db_id
+          });
+          continue;
+        }
+        this.initializeSession(row.session_db_id, undefined, undefined);
+        hydrated.push(row.session_db_id);
+      } catch (err) {
+        logger.warn('SESSION', 'Failed to hydrate orphaned session', {
+          sessionId: row.session_db_id
+        }, err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    if (hydrated.length > 0) {
+      logger.info('SESSION', `Hydrated ${hydrated.length} orphaned session(s) from pending_messages`, {
+        sessionIds: hydrated
+      });
+    }
+    return hydrated;
+  }
+
   async confirmClaimedMessages(sessionDbId: number): Promise<number> {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];

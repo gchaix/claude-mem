@@ -71,6 +71,135 @@ export class SessionStore {
     this.dropDeadPendingMessagesColumns();
     this.ensurePendingMessagesToolUseIdColumn();
     this.dropWorkerPidColumn();
+    this.addFailedStateAndRetryCountToPendingMessages();
+  }
+
+  /**
+   * Migration 35: re-introduce 'failed' status and retry_count for
+   * rate-limit resilience. Upstream collapsed pending_messages.status to
+   * ('pending', 'processing') only — fine for clean crashes, but poison
+   * messages (always-failing parses, 429 storms exhausting in-memory retry
+   * budget) have nowhere to land except being silently cleared by the
+   * restart-guard path.
+   *
+   * Restores:
+   *   - status CHECK now includes 'failed'
+   *   - retry_count INTEGER NOT NULL DEFAULT 0
+   *   - completed_at_epoch INTEGER (nullable; stamped on terminal state)
+   *
+   * Paired with PendingMessageStore.markFailed / markRateLimited and the
+   * startup failed-message triage in worker-service.
+   */
+  private addFailedStateAndRetryCountToPendingMessages(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(35) as SchemaVersion | undefined;
+
+    const table = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_messages'").get() as { sql: string } | null;
+    if (!table) {
+      if (!applied) {
+        this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      }
+      return;
+    }
+
+    const cols = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const colNames = new Set(cols.map(c => c.name));
+    const tableSqlHasFailed = table.sql.includes("'failed'");
+    const hasRetryCount = colNames.has('retry_count');
+    const hasCompletedAt = colNames.has('completed_at_epoch');
+
+    if (tableSqlHasFailed && hasRetryCount && hasCompletedAt) {
+      if (!applied) {
+        this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      }
+      return;
+    }
+
+    logger.debug('DB', 'Migration 35: extending pending_messages with failed status + retry_count');
+
+    this.db.run('PRAGMA foreign_keys = OFF');
+    this.db.run('BEGIN TRANSACTION');
+    try {
+      this.db.run('DROP TABLE IF EXISTS pending_messages_m35');
+
+      this.db.run(`
+        CREATE TABLE pending_messages_m35 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_db_id INTEGER NOT NULL,
+          content_session_id TEXT NOT NULL,
+          tool_use_id TEXT,
+          message_type TEXT NOT NULL CHECK(message_type IN ('observation', 'summarize')),
+          tool_name TEXT,
+          tool_input TEXT,
+          tool_response TEXT,
+          cwd TEXT,
+          last_user_message TEXT,
+          last_assistant_message TEXT,
+          prompt_number INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'failed')),
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          created_at_epoch INTEGER NOT NULL,
+          completed_at_epoch INTEGER,
+          agent_type TEXT,
+          agent_id TEXT,
+          FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
+        )
+      `);
+
+      const hasCol = (name: string) => colNames.has(name);
+      this.db.run(`
+        INSERT INTO pending_messages_m35 (
+          id, session_db_id, content_session_id, tool_use_id, message_type,
+          tool_name, tool_input, tool_response, cwd, last_user_message,
+          last_assistant_message, prompt_number, status, retry_count,
+          created_at_epoch, completed_at_epoch, agent_type, agent_id
+        )
+        SELECT
+          id,
+          session_db_id,
+          content_session_id,
+          ${hasCol('tool_use_id') ? 'tool_use_id' : 'NULL'},
+          message_type,
+          ${hasCol('tool_name') ? 'tool_name' : 'NULL'},
+          ${hasCol('tool_input') ? 'tool_input' : 'NULL'},
+          ${hasCol('tool_response') ? 'tool_response' : 'NULL'},
+          ${hasCol('cwd') ? 'cwd' : 'NULL'},
+          ${hasCol('last_user_message') ? 'last_user_message' : 'NULL'},
+          ${hasCol('last_assistant_message') ? 'last_assistant_message' : 'NULL'},
+          ${hasCol('prompt_number') ? 'prompt_number' : 'NULL'},
+          status,
+          ${hasCol('retry_count') ? 'retry_count' : '0'},
+          created_at_epoch,
+          ${hasCol('completed_at_epoch') ? 'completed_at_epoch' : 'NULL'},
+          ${hasCol('agent_type') ? 'agent_type' : 'NULL'},
+          ${hasCol('agent_id') ? 'agent_id' : 'NULL'}
+        FROM pending_messages
+      `);
+
+      this.db.run('DROP TABLE pending_messages');
+      this.db.run('ALTER TABLE pending_messages_m35 RENAME TO pending_messages');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_session ON pending_messages(session_db_id)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_status ON pending_messages(status)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_claude_session ON pending_messages(content_session_id)');
+      this.db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_session_tool
+        ON pending_messages(content_session_id, tool_use_id)
+        WHERE tool_use_id IS NOT NULL
+      `);
+
+      if (!applied) {
+        this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      }
+      this.db.run('COMMIT');
+      this.db.run('PRAGMA foreign_keys = ON');
+      logger.debug('DB', 'Migration 35 complete: pending_messages now supports failed status + retry_count');
+    } catch (error) {
+      this.db.run('ROLLBACK');
+      this.db.run('PRAGMA foreign_keys = ON');
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`Migration 35 failed: ${String(error)}`);
+    }
   }
 
   private dropWorkerPidColumn(): void {
@@ -101,7 +230,10 @@ export class SessionStore {
 
     const cols = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
     const colNames = new Set(cols.map(c => c.name));
-    const deadColumns = ['retry_count', 'failed_at_epoch', 'completed_at_epoch'];
+    // v13-port: retry_count and completed_at_epoch are RESTORED by migration 35
+    // for rate-limit resilience. They are intentionally kept.
+    // failed_at_epoch remains dead (superseded by completed_at_epoch + status='failed').
+    const deadColumns = ['failed_at_epoch'];
     const toDrop = deadColumns.filter(name => colNames.has(name));
     if (applied && toDrop.length === 0) return;
 

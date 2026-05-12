@@ -193,6 +193,10 @@ export class KnowledgeAgent {
 
   private getModelId(): string {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    // Bedrock mode: prefer the Bedrock-format model ID. See ClaudeProvider.getModelId.
+    if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true' && settings.CLAUDE_MEM_BEDROCK_MODEL) {
+      return settings.CLAUDE_MEM_BEDROCK_MODEL;
+    }
     return settings.CLAUDE_MEM_MODEL;
   }
 

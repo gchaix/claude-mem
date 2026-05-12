@@ -457,10 +457,18 @@ export function spawnDaemon(
     ? [runtimePath, scriptPath, '--daemon']
     : [scriptPath, '--daemon'];
 
+  // Pin cwd to $HOME so the daemon survives directory deletions (worktree
+  // cleanup, rm -rf in a shell the worker was spawned from, etc.). Without
+  // this the daemon inherits the caller's cwd; if that directory later
+  // disappears, every child_process.spawn/execSync in the daemon fails
+  // with ENOENT and surfaces as misleading errors like "Claude executable
+  // not found" (the executable resolves fine — Node can't fork a child
+  // whose parent has no valid cwd).
   const child = spawnHidden(execPath, args, {
     detached: true,
     stdio: 'ignore',
-    env
+    env,
+    cwd: homedir(),
   });
 
   if (child.pid === undefined) {

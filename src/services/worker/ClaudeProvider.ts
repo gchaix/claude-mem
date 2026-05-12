@@ -488,6 +488,13 @@ export class ClaudeProvider {
   private getModelId(): string {
     const settingsPath = paths.settings();
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
+    // Bedrock mode: prefer the Bedrock-format model ID since the spawned CLI
+    // talks to Bedrock and only accepts Bedrock-format identifiers. Passing
+    // an Anthropic-format ID (e.g. claude-sonnet-4-6) makes Bedrock reject
+    // the request as invalid.
+    if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true' && settings.CLAUDE_MEM_BEDROCK_MODEL) {
+      return settings.CLAUDE_MEM_BEDROCK_MODEL;
+    }
     return settings.CLAUDE_MEM_MODEL;
   }
 }

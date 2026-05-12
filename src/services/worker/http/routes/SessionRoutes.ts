@@ -15,10 +15,11 @@ import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
 import { PrivacyCheckValidator } from '../../validation/PrivacyCheckValidator.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
+import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_PROJECT } from '../../../../shared/paths.js';
 import { getProjectContext } from '../../../../utils/project-name.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { handleGeneratorExit } from '../../session/GeneratorExitHandler.js';
+import { isClassified } from '../../provider-errors.js';
 import { SessionCompletionHandler } from '../../session/SessionCompletionHandler.js';
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
 
@@ -136,6 +137,31 @@ export class SessionRoutes extends BaseRouteHandler {
             error: errorMsg
           });
           myController.abort();
+          return;
+        }
+
+        // Rate-limit / transient provider errors: soft backoff, not failure.
+        // Flag the session so GeneratorExitHandler preserves pending work and
+        // uses an extended backoff schedule that bypasses the restart-guard.
+        if (isClassified(error) && (error.kind === 'rate_limit' || error.kind === 'transient')) {
+          session.abortReason = 'rate-limit';
+          if (error.retryAfterMs !== undefined) {
+            session.retryAfterMs = error.retryAfterMs;
+          }
+          logger.warn('SESSION', 'Rate-limited by provider — will back off and retry', {
+            sessionId: session.sessionDbId,
+            provider,
+            errorKind: error.kind,
+            retryAfterMs: error.retryAfterMs,
+            errorMessage: errorMsg
+          });
+          try {
+            await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+          } catch (dbError) {
+            logger.error('HTTP', 'Failed to reset processing messages after rate-limit', {
+              sessionId: session.sessionDbId
+            }, dbError instanceof Error ? dbError : new Error(String(dbError)));
+          }
           return;
         }
 
@@ -335,6 +361,16 @@ export class SessionRoutes extends BaseRouteHandler {
     const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : undefined;
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const customTitle = req.body.customTitle || undefined;
+
+    // Server-side guard: reject observer-sessions before creating DB rows.
+    // The hook layer normally filters these via shouldTrackProject(), but
+    // outdated hooks or unset env vars bypass that check and flood the
+    // queue with observer-on-observer loops. Reject at the HTTP boundary
+    // so a single stale hook can't generate thousands of rows.
+    if (project === OBSERVER_SESSIONS_PROJECT) {
+      res.json({ skipped: true, reason: 'observer_session' });
+      return;
+    }
 
     if (rawPrompt && isInternalProtocolPayload(rawPrompt)) {
       logger.debug('HTTP', 'session-init: skipping internal protocol payload before session creation', { contentSessionId });

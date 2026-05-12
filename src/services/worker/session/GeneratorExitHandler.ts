@@ -101,7 +101,52 @@ export async function handleGeneratorExit(
   if (pendingCount === 0) {
     session.restartGuard?.recordSuccess();
     session.consecutiveRestarts = 0;
+    session.rateLimitBackoffCount = 0;
+    session.retryAfterMs = undefined;
     await terminateSession('Natural completion', false);
+    return;
+  }
+
+  // Rate-limit path: preserve pending work, bypass the restart-guard's
+  // consecutive-failure trip, and use an extended backoff that honors the
+  // provider's Retry-After when supplied. Rate-limit windows can last 30+
+  // minutes; the normal 1s→8s schedule would retry 5 times in <15s and trip
+  // the guard, abandoning pending observations.
+  if (reason === 'rate-limit') {
+    session.rateLimitBackoffCount = (session.rateLimitBackoffCount ?? 0) + 1;
+
+    // Exponential schedule: 30s → 60s → 120s → 300s cap.
+    // Provider-supplied retryAfterMs takes precedence when present.
+    const scheduled = [30_000, 60_000, 120_000, 300_000];
+    const idx = Math.min(session.rateLimitBackoffCount - 1, scheduled.length - 1);
+    const backoffMs = session.retryAfterMs ?? scheduled[idx];
+
+    logger.warn('SESSION', `Rate-limit backoff — preserving pending and scheduling retry`, {
+      sessionId: sessionDbId,
+      pendingCount,
+      rateLimitBackoffCount: session.rateLimitBackoffCount,
+      backoffMs,
+      retryAfterMsFromProvider: session.retryAfterMs,
+    });
+
+    // Clear the one-shot retryAfterMs so the next rate-limit round falls back
+    // to the scheduled exponential unless the provider hints again.
+    session.retryAfterMs = undefined;
+
+    const oldController = session.abortController;
+    session.abortController = new AbortController();
+    oldController.abort();
+
+    if (session.respawnTimer) {
+      clearTimeout(session.respawnTimer);
+    }
+    session.respawnTimer = setTimeout(() => {
+      session.respawnTimer = undefined;
+      const stillExists = deps.sessionManager.getSession(sessionDbId);
+      if (stillExists && !stillExists.generatorPromise) {
+        void restartGenerator(stillExists, 'rate-limit-restart');
+      }
+    }, backoffMs);
     return;
   }
 

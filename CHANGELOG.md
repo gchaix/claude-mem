@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [13.2.0] - 2026-05-12
+
+## What's new
+
+### `wowerpoint` skill — kawaii NotebookLM slide-deck generator
+
+Turn one source document into a kawaii NotebookLM slide-deck PDF. Wraps the `notebooklm` CLI with the kawaii-prompt + `--format detailed` defaults and a spawn-subagent pattern so generation (~10 min) never blocks the main conversation.
+
+- **Single-source-per-deck** is enforced by the workflow shape: confirm or write the source doc *before* adding it to NotebookLM. Don't paper over a weak source by stacking more sources — write a comprehensive doc first.
+- **Slide-deck only.** Videos and podcasts from the same engine are noticeably worse and out of scope; the skill refers users to the `notebooklm` CLI directly for those formats.
+- **Default prompt template:** `Use kawaii characters to tell the story of <subject>. Keep it warm and clear.` Pass any user-supplied prompt through verbatim.
+- **Setup requires** `notebooklm-py` (via `uv tool install --with playwright`), `playwright install chromium`, and `jq`.
+- **Spawn-and-end-turn** pattern: the subagent's completion notification fires when the PDF is on disk; the main conversation never blocks on the ~10 min render.
+
+See PR #2430 for the full design notes and review history.
+
+## Skills inventory
+
+This release brings the plugin to **12 skills**: babysit, do, how-it-works, knowledge-agent, learn-codebase, make-plan, mem-search, pathfinder, smart-explore, timeline-report, version-bump, wowerpoint.
+
 ## [13.1.0] - 2026-05-11
 
 ## Server-beta event pipeline (phases 4–13)

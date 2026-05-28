@@ -8,6 +8,7 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import type { ModeConfig, ObservationType, ObservationConcept } from './types.js';
 import { logger } from '../../utils/logger.js';
 import { getPackageRoot } from '../../shared/paths.js';
@@ -18,19 +19,20 @@ export class ModeManager {
   private modesDir: string;
 
   private constructor() {
-    // Modes are in plugin/modes/
-    // getPackageRoot() points to plugin/ in production and src/ in development
-    // We want to ensure we find the modes directory which is at the project root/plugin/modes
     const packageRoot = getPackageRoot();
-    
-    // Check for plugin/modes relative to package root (covers both dev and prod if paths are right)
+
     const possiblePaths = [
-      join(packageRoot, 'modes'),           // Production (plugin/modes)
-      join(packageRoot, '..', 'plugin', 'modes'), // Development (src/../plugin/modes)
+      join(packageRoot, 'modes'),
+      join(packageRoot, '..', 'plugin', 'modes'),
+      join(packageRoot, '..', 'modes'),
+      join(homedir(), '.claude-mem', 'modes'),
     ];
 
     const foundPath = possiblePaths.find(p => existsSync(p));
     this.modesDir = foundPath || possiblePaths[0];
+    if (!foundPath) {
+      logger.warn('SYSTEM', `ModeManager: no modes directory found`, { packageRoot, checked: possiblePaths });
+    }
   }
 
   /**

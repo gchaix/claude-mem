@@ -101,6 +101,11 @@ async function buildHooks() {
       description: 'Runtime dependencies for claude-mem bundled hooks',
       type: 'module',
       dependencies: {
+        // glob is externalized in worker-service / mcp-server / context-generator
+        // builds because its lru-cache dependency uses top-level await (which
+        // esbuild cannot emit into CJS). It must be installed in the cache dir
+        // so Bun can resolve it at runtime.
+        'glob': '^11.0.3',
         // Externalized from mcp-server.cjs to avoid Zod version conflicts when
         // OpenCode's Bun bundler assembles hook scripts (#2113). MCP SDK
         // transitively imports Zod; loading it via node_modules at runtime

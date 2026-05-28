@@ -9,6 +9,11 @@
  * - Call Anthropic Messages API for observation extraction
  * - Parse XML responses (same format as other agents)
  * - Sync to database and Chroma
+ *
+ * Structured to mirror OpenRouterAgent so the worker has a single shape for
+ * non-SDK providers: sequential message processing, fire-and-forget
+ * processAgentResponse() (failure handling lives inside the response processor),
+ * and no fallback-agent indirection.
  */
 
 import { execFileSync } from 'child_process';
@@ -18,14 +23,13 @@ import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import { ModeManager } from '../domain/ModeManager.js';
-import type { ActiveSession, ConversationMessage, PendingMessageWithId } from '../worker-types.js';
+import type { ModeConfig } from '../domain/types.js';
+import type { ActiveSession, ConversationMessage } from '../worker-types.js';
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import {
   isAbortError,
   processAgentResponse,
-  shouldFallbackToClaude,
-  type FallbackAgent,
   type WorkerRef
 } from './agents/index.js';
 
@@ -50,7 +54,6 @@ interface AnthropicResponse {
   };
 }
 
-// Anthropic message format
 interface AnthropicMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -66,7 +69,6 @@ interface AnthropicConfig {
 export class AnthropicAgent {
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private fallbackAgent: FallbackAgent | null = null;
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
@@ -74,255 +76,230 @@ export class AnthropicAgent {
   }
 
   /**
-   * Set the fallback agent (Claude SDK) for when Anthropic API fails
-   * Must be set after construction to avoid circular dependency
-   */
-  setFallbackAgent(agent: FallbackAgent): void {
-    this.fallbackAgent = agent;
-  }
-
-  /**
    * Start Anthropic agent for a session
    * Uses multi-turn conversation to maintain context across messages
    */
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
+    const config = this.getAnthropicConfig();
+
+    // Generate synthetic memorySessionId (Anthropic is stateless)
+    if (!session.memorySessionId) {
+      const syntheticMemorySessionId = `anthropic-${session.contentSessionId}-${Date.now()}`;
+      session.memorySessionId = syntheticMemorySessionId;
+      this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+      logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=Anthropic`);
+    }
+
+    const mode = ModeManager.getInstance().getActiveMode();
+
+    const initPrompt = session.lastPromptNumber === 1
+      ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode)
+      : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode);
+
+    session.conversationHistory.push({ role: 'user', content: initPrompt });
+
     try {
-      const config = this.getAnthropicConfig();
-
-      // Generate synthetic memorySessionId (Anthropic is stateless)
-      if (!session.memorySessionId) {
-        const syntheticMemorySessionId = `anthropic-${session.contentSessionId}-${Date.now()}`;
-        session.memorySessionId = syntheticMemorySessionId;
-        this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
-        logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=Anthropic`);
-      }
-
-      // Load active mode
-      const mode = ModeManager.getInstance().getActiveMode();
-
-      // Build initial prompt
-      const initPrompt = session.lastPromptNumber === 1
-        ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode)
-        : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode);
-
-      // Add to conversation history and query Anthropic with full context
-      session.conversationHistory.push({ role: 'user', content: initPrompt });
       const initResponse = await this.queryAnthropicMultiTurn(session.conversationHistory, config);
-
-      if (initResponse.content) {
-        // Track token usage (Anthropic provides exact counts)
-        const inputTokens = initResponse.inputTokens || 0;
-        const outputTokens = initResponse.outputTokens || 0;
-        const tokensUsed = inputTokens + outputTokens;
-        session.cumulativeInputTokens += inputTokens;
-        session.cumulativeOutputTokens += outputTokens;
-
-        // Process response using shared ResponseProcessor
-        const initResult = await processAgentResponse(
-          initResponse.content,
-          session,
-          this.dbManager,
-          this.sessionManager,
-          worker,
-          tokensUsed,
-          null,
-          'Anthropic',
-          undefined
-        );
-
-        if (initResult.status === 'rate_limited' || initResult.status === 'error') {
-          logger.warn('SDK', `Anthropic init response failed (${initResult.status}), aborting session`, {
-            sessionId: session.sessionDbId
-          });
-          return;
-        }
-      } else {
-        logger.error('SDK', 'Empty Anthropic init response - session may lack context', {
-          sessionId: session.sessionDbId,
-          model: config.model
-        });
-      }
-
-      // Track lastCwd from messages for CLAUDE.md generation
-      let lastCwd: string | undefined;
-
-      // Read batch size from settings
-      const batchSize = Math.max(1, parseInt(
-        SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_ANTHROPIC_BATCH_SIZE
-      ) || 8);
-
-      // Process pending messages in batches for parallel LLM utilization
-      for await (const firstMessage of this.sessionManager.getMessageIterator(session.sessionDbId)) {
-        // Build batch: first message from iterator + additional from DB
-        const batchMessages: PendingMessageWithId[] = [firstMessage];
-
-        if (batchSize > 1) {
-          const pendingStore = this.sessionManager.getPendingMessageStore();
-          const additional = pendingStore.claimBatch(session.sessionDbId, batchSize - 1);
-          for (const pm of additional) {
-            const msg = pendingStore.toPendingMessage(pm);
-            batchMessages.push({ ...msg, _persistentId: pm.id, _createdAtEpoch: pm.created_at_epoch } as PendingMessageWithId);
-          }
-        }
-
-        logger.info('SDK', `BATCH_START | sessionDbId=${session.sessionDbId} | size=${batchMessages.length} | ids=[${batchMessages.map(m => m._persistentId).join(',')}]`);
-
-        // Phase 1: Build batch items with independent history snapshots
-        interface BatchItem {
-          message: PendingMessageWithId;
-          historySnapshot: ConversationMessage[];
-          prompt: string;
-          originalTimestamp: number | null;
-          cwd: string | undefined;
-          promptType: 'observation' | 'summarize';
-        }
-
-        const batchItems: BatchItem[] = [];
-        for (const message of batchMessages) {
-          if (message.cwd) {
-            lastCwd = message.cwd;
-          }
-          const itemCwd = message.cwd || lastCwd;
-          const originalTimestamp = message._createdAtEpoch ?? session.earliestPendingTimestamp;
-
-          if (message.type === 'observation') {
-            if (message.prompt_number !== undefined) {
-              session.lastPromptNumber = message.prompt_number;
-            }
-            if (!session.memorySessionId) {
-              throw new Error('Cannot process observations: memorySessionId not yet captured.');
-            }
-
-            const obsPrompt = buildObservationPrompt({
-              id: 0,
-              tool_name: message.tool_name!,
-              tool_input: JSON.stringify(message.tool_input),
-              tool_output: JSON.stringify(message.tool_response),
-              created_at_epoch: originalTimestamp ?? Date.now(),
-              cwd: message.cwd
-            });
-
-            // Snapshot history + this prompt for independent LLM call
-            const historySnapshot = [...session.conversationHistory, { role: 'user' as const, content: obsPrompt }];
-            batchItems.push({ message, historySnapshot, prompt: obsPrompt, originalTimestamp, cwd: itemCwd, promptType: 'observation' });
-
-          } else if (message.type === 'summarize') {
-            if (!session.memorySessionId) {
-              throw new Error('Cannot process summary: memorySessionId not yet captured.');
-            }
-
-            const summaryPrompt = buildSummaryPrompt({
-              id: session.sessionDbId,
-              memory_session_id: session.memorySessionId,
-              project: session.project,
-              user_prompt: session.userPrompt,
-              last_assistant_message: message.last_assistant_message || ''
-            }, mode);
-
-            const historySnapshot = [...session.conversationHistory, { role: 'user' as const, content: summaryPrompt }];
-            batchItems.push({ message, historySnapshot, prompt: summaryPrompt, originalTimestamp, cwd: itemCwd, promptType: 'summarize' });
-          }
-        }
-
-        // Phase 2: Fire parallel LLM calls via Promise.all
-        const llmResults = await Promise.all(
-          batchItems.map(async (item) => {
-            try {
-              const response = await this.queryAnthropicMultiTurn(item.historySnapshot, config);
-              return { success: true as const, response, item };
-            } catch (error) {
-              // Convert request exceptions to result objects so
-              // other batch items can proceed. Failed items are retried via markFailed().
-              return { success: false as const, error, item };
-            }
-          })
-        );
-
-        // Phase 3: Process results SEQUENTIALLY to protect shared session state
-        const pendingStore = this.sessionManager.getPendingMessageStore();
-        for (const result of llmResults) {
-          const { item } = result;
-
-          if (!result.success) {
-            logger.warn('SDK', `BATCH_ITEM_FAILED | messageId=${item.message._persistentId} | error=${result.error instanceof Error ? result.error.message : String(result.error)}`);
-            pendingStore.markFailed(item.message._persistentId);
-            continue;
-          }
-
-          const { response } = result;
-          const inputTokens = response.inputTokens || 0;
-          const outputTokens = response.outputTokens || 0;
-          const tokensUsed = inputTokens + outputTokens;
-          session.cumulativeInputTokens += inputTokens;
-          session.cumulativeOutputTokens += outputTokens;
-
-          // Push prompt to real conversation history (sequential, so order is preserved)
-          session.conversationHistory.push({ role: 'user', content: item.prompt });
-
-          // Set processingMessageIds to just this item before calling processAgentResponse
-          session.processingMessageIds = [item.message._persistentId];
-
-          // Process response using shared ResponseProcessor.
-          // Empty/non-XML paths call markFailed() to preserve messages for retry.
-          const obsResult = await processAgentResponse(
-            response.content || '',
-            session,
-            this.dbManager,
-            this.sessionManager,
-            worker,
-            tokensUsed,
-            item.originalTimestamp,
-            'Anthropic',
-            item.cwd
-          );
-
-          if (obsResult.status === 'rate_limited') {
-            logger.warn('SDK', 'Anthropic rate-limited during batch item, aborting session', {
-              sessionId: session.sessionDbId
-            });
-            return;
-          }
-        }
-
-        logger.info('SDK', `BATCH_COMPLETE | sessionDbId=${session.sessionDbId} | total=${batchItems.length} | succeeded=${llmResults.filter(r => r.success).length} | failed=${llmResults.filter(r => !r.success).length}`);
-      }
-
-      // Mark session complete
-      const sessionDuration = Date.now() - session.startTime;
-      logger.success('SDK', 'Anthropic agent completed', {
-        sessionId: session.sessionDbId,
-        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-        historyLength: session.conversationHistory.length,
-        model: config.model
-      });
-
+      await this.handleInitResponse(initResponse, session, worker, config.model);
     } catch (error: unknown) {
-      if (isAbortError(error)) {
-        logger.warn('SDK', 'Anthropic agent aborted', { sessionId: session.sessionDbId });
-        throw error;
+      if (error instanceof Error) {
+        logger.error('SDK', 'Anthropic init failed', { sessionId: session.sessionDbId, model: config.model }, error);
+      } else {
+        logger.error('SDK', 'Anthropic init failed with non-Error', { sessionId: session.sessionDbId, model: config.model }, new Error(String(error)));
       }
+      await this.handleSessionError(error, session, worker);
+      return;
+    }
 
-      // Check if we should fall back to Claude SDK
-      if (shouldFallbackToClaude(error) && this.fallbackAgent) {
-        logger.warn('SDK', 'Anthropic API failed, falling back to Claude SDK', {
-          sessionDbId: session.sessionDbId,
-          error: error instanceof Error ? error.message : String(error),
-          historyLength: session.conversationHistory.length
-        });
+    let lastCwd: string | undefined;
 
-        return this.fallbackAgent.startSession(session, worker);
+    try {
+      for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+        lastCwd = await this.processOneMessage(session, message, lastCwd, config, worker, mode);
       }
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        logger.error('SDK', 'Anthropic message processing failed', { sessionId: session.sessionDbId, model: config.model }, error);
+      } else {
+        logger.error('SDK', 'Anthropic message processing failed with non-Error', { sessionId: session.sessionDbId, model: config.model }, new Error(String(error)));
+      }
+      await this.handleSessionError(error, session, worker);
+      return;
+    }
 
-      logger.failure('SDK', 'Anthropic agent error', { sessionDbId: session.sessionDbId }, error as Error);
-      throw error;
+    const sessionDuration = Date.now() - session.startTime;
+    logger.success('SDK', 'Anthropic agent completed', {
+      sessionId: session.sessionDbId,
+      duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+      historyLength: session.conversationHistory.length,
+      model: config.model
+    });
+  }
+
+  /**
+   * Track this message and capture subagent identity so the response processor
+   * can label observation rows correctly.
+   */
+  private prepareMessageMetadata(session: ActiveSession, message: { _persistentId: number; agentId?: string | null; agentType?: string | null }): void {
+    session.processingMessageIds.push(message._persistentId);
+    session.pendingAgentId = message.agentId ?? null;
+    session.pendingAgentType = message.agentType ?? null;
+  }
+
+  /**
+   * Update token counts and forward init response to the shared processor.
+   */
+  private async handleInitResponse(
+    initResponse: { content: string; inputTokens?: number; outputTokens?: number },
+    session: ActiveSession,
+    worker: WorkerRef | undefined,
+    model: string
+  ): Promise<void> {
+    if (initResponse.content) {
+      session.conversationHistory.push({ role: 'assistant', content: initResponse.content });
+      const inputTokens = initResponse.inputTokens || 0;
+      const outputTokens = initResponse.outputTokens || 0;
+      const tokensUsed = inputTokens + outputTokens;
+      session.cumulativeInputTokens += inputTokens;
+      session.cumulativeOutputTokens += outputTokens;
+
+      await processAgentResponse(
+        initResponse.content, session, this.dbManager, this.sessionManager,
+        worker, tokensUsed, null, 'Anthropic', undefined, model
+      );
+    } else {
+      logger.error('SDK', 'Empty Anthropic init response - session may lack context', {
+        sessionId: session.sessionDbId, model
+      });
     }
   }
 
   /**
+   * Dispatch one queue message to the right handler.
+   */
+  private async processOneMessage(
+    session: ActiveSession,
+    message: { _persistentId: number; agentId?: string | null; agentType?: string | null; type?: string; cwd?: string; prompt_number?: number; tool_name?: string; tool_input?: unknown; tool_response?: unknown; last_assistant_message?: string },
+    lastCwd: string | undefined,
+    config: AnthropicConfig,
+    worker: WorkerRef | undefined,
+    mode: ModeConfig
+  ): Promise<string | undefined> {
+    this.prepareMessageMetadata(session, message);
+
+    if (message.cwd) {
+      lastCwd = message.cwd;
+    }
+    const originalTimestamp = session.earliestPendingTimestamp;
+
+    if (message.type === 'observation') {
+      await this.processObservationMessage(session, message, originalTimestamp, lastCwd, config, worker, mode);
+    } else if (message.type === 'summarize') {
+      await this.processSummaryMessage(session, message, originalTimestamp, lastCwd, config, worker, mode);
+    }
+
+    return lastCwd;
+  }
+
+  private async processObservationMessage(
+    session: ActiveSession,
+    message: { prompt_number?: number; tool_name?: string; tool_input?: unknown; tool_response?: unknown; cwd?: string },
+    originalTimestamp: number | null,
+    lastCwd: string | undefined,
+    config: AnthropicConfig,
+    worker: WorkerRef | undefined,
+    _mode: ModeConfig
+  ): Promise<void> {
+    if (message.prompt_number !== undefined) {
+      session.lastPromptNumber = message.prompt_number;
+    }
+
+    if (!session.memorySessionId) {
+      throw new Error('Cannot process observations: memorySessionId not yet captured. This session may need to be reinitialized.');
+    }
+
+    const obsPrompt = buildObservationPrompt({
+      id: 0,
+      tool_name: message.tool_name!,
+      tool_input: JSON.stringify(message.tool_input),
+      tool_output: JSON.stringify(message.tool_response),
+      created_at_epoch: originalTimestamp ?? Date.now(),
+      cwd: message.cwd
+    });
+
+    session.conversationHistory.push({ role: 'user', content: obsPrompt });
+    const obsResponse = await this.queryAnthropicMultiTurn(session.conversationHistory, config);
+
+    let tokensUsed = 0;
+    if (obsResponse.content) {
+      session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
+      const inputTokens = obsResponse.inputTokens || 0;
+      const outputTokens = obsResponse.outputTokens || 0;
+      tokensUsed = inputTokens + outputTokens;
+      session.cumulativeInputTokens += inputTokens;
+      session.cumulativeOutputTokens += outputTokens;
+    }
+
+    await processAgentResponse(
+      obsResponse.content || '', session, this.dbManager, this.sessionManager,
+      worker, tokensUsed, originalTimestamp, 'Anthropic', lastCwd, config.model
+    );
+  }
+
+  private async processSummaryMessage(
+    session: ActiveSession,
+    message: { last_assistant_message?: string },
+    originalTimestamp: number | null,
+    lastCwd: string | undefined,
+    config: AnthropicConfig,
+    worker: WorkerRef | undefined,
+    mode: ModeConfig
+  ): Promise<void> {
+    if (!session.memorySessionId) {
+      throw new Error('Cannot process summary: memorySessionId not yet captured. This session may need to be reinitialized.');
+    }
+
+    const summaryPrompt = buildSummaryPrompt({
+      id: session.sessionDbId,
+      memory_session_id: session.memorySessionId,
+      project: session.project,
+      user_prompt: session.userPrompt,
+      last_assistant_message: message.last_assistant_message || ''
+    }, mode);
+
+    session.conversationHistory.push({ role: 'user', content: summaryPrompt });
+    const summaryResponse = await this.queryAnthropicMultiTurn(session.conversationHistory, config);
+
+    let tokensUsed = 0;
+    if (summaryResponse.content) {
+      session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
+      const inputTokens = summaryResponse.inputTokens || 0;
+      const outputTokens = summaryResponse.outputTokens || 0;
+      tokensUsed = inputTokens + outputTokens;
+      session.cumulativeInputTokens += inputTokens;
+      session.cumulativeOutputTokens += outputTokens;
+    }
+
+    await processAgentResponse(
+      summaryResponse.content || '', session, this.dbManager, this.sessionManager,
+      worker, tokensUsed, originalTimestamp, 'Anthropic', lastCwd, config.model
+    );
+  }
+
+  private async handleSessionError(error: unknown, session: ActiveSession, _worker?: WorkerRef): Promise<never> {
+    if (isAbortError(error)) {
+      logger.warn('SDK', 'Anthropic agent aborted', { sessionId: session.sessionDbId });
+      throw error;
+    }
+
+    logger.failure('SDK', 'Anthropic agent error', { sessionDbId: session.sessionDbId }, error instanceof Error ? error : new Error(String(error)));
+    throw error;
+  }
+
+  /**
    * Get a fresh auth token for Anthropic API requests.
-   * If CLAUDE_MEM_ANTHROPIC_API_KEY is set, use it directly.
-   * Otherwise, call the API_KEY_HELPER script to get a dynamic token.
-   * Uses execFileSync (not execSync) to avoid shell injection.
+   * Static API key takes precedence; otherwise the helper script is invoked
+   * with execFileSync (no shell) to produce a token to stdout.
    */
   private getAuthToken(config: AnthropicConfig): string {
     if (config.apiKey) {
@@ -353,16 +330,12 @@ export class AnthropicAgent {
     }
   }
 
-  /**
-   * Estimate token count from text (conservative estimate)
-   */
   private estimateTokens(text: string): number {
     return Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE);
   }
 
   /**
-   * Truncate conversation history to prevent runaway context costs
-   * Keeps most recent messages within token budget
+   * Sliding window: keep most recent messages within the configured budget.
    */
   private truncateHistory(history: ConversationMessage[]): ConversationMessage[] {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
@@ -377,7 +350,6 @@ export class AnthropicAgent {
       }
     }
 
-    // Sliding window: keep most recent messages within limits
     const truncated: ConversationMessage[] = [];
     let tokenCount = 0;
 
@@ -405,8 +377,8 @@ export class AnthropicAgent {
 
   /**
    * Convert shared ConversationMessage array to Anthropic Messages API format.
-   * Extracts the first user message as the system prompt.
-   * Merges consecutive same-role messages (Anthropic requires alternating turns).
+   * The first user message becomes the system prompt; consecutive same-role
+   * messages are merged because Anthropic requires alternating turns.
    */
   private conversationToAnthropicFormat(history: ConversationMessage[]): {
     system: string;
@@ -416,7 +388,6 @@ export class AnthropicAgent {
       return { system: '', messages: [] };
     }
 
-    // Use first user message as system prompt
     let system = '';
     let startIdx = 0;
     if (history[0].role === 'user') {
@@ -424,23 +395,19 @@ export class AnthropicAgent {
       startIdx = 1;
     }
 
-    // Convert remaining messages, merging consecutive same-role messages
     const messages: AnthropicMessage[] = [];
     for (let i = startIdx; i < history.length; i++) {
       const role: 'user' | 'assistant' = history[i].role === 'assistant' ? 'assistant' : 'user';
       const content = history[i].content;
 
       if (messages.length > 0 && messages[messages.length - 1].role === role) {
-        // Merge consecutive same-role messages
         messages[messages.length - 1].content += '\n\n' + content;
       } else {
         messages.push({ role, content });
       }
     }
 
-    // Anthropic requires at least one message and it must start with 'user' role
     if (messages.length === 0) {
-      // All content was extracted as system prompt — add a placeholder user message
       messages.push({ role: 'user', content: 'Process the above instructions.' });
     } else if (messages[0].role === 'assistant') {
       messages.unshift({ role: 'user', content: '(continue)' });
@@ -449,14 +416,10 @@ export class AnthropicAgent {
     return { system, messages };
   }
 
-  /**
-   * Query Anthropic Messages API with full conversation history (multi-turn)
-   */
   private async queryAnthropicMultiTurn(
     history: ConversationMessage[],
     config: AnthropicConfig
   ): Promise<{ content: string; inputTokens?: number; outputTokens?: number }> {
-    // Truncate history to prevent runaway costs
     const truncatedHistory = this.truncateHistory(history);
     const { system, messages } = this.conversationToAnthropicFormat(truncatedHistory);
     const totalChars = truncatedHistory.reduce((sum, m) => sum + m.content.length, 0);
@@ -469,9 +432,7 @@ export class AnthropicAgent {
       apiMessages: messages.length
     });
 
-    // Get a fresh token for each request (helper scripts cache internally)
     const token = this.getAuthToken(config);
-
     const url = `${config.baseUrl}/v1/messages`;
 
     let response: Response;
@@ -490,10 +451,11 @@ export class AnthropicAgent {
           messages,
           temperature: 0.3,
         }),
-        signal: AbortSignal.timeout(300_000),  // 5-minute timeout
+        signal: AbortSignal.timeout(300_000),
       });
     } catch (fetchError: unknown) {
-      // TLS diagnostic for corporate proxy environments
+      // TLS diagnostic for corporate proxy environments — most useful hint we can
+      // surface is to point at NODE_EXTRA_CA_CERTS, which the launchd plist owns.
       if (fetchError instanceof Error && fetchError.message.includes('UNABLE_TO_VERIFY_LEAF_SIGNATURE')) {
         logger.error('SDK', 'TLS certificate verification failed. If using a corporate proxy, set NODE_EXTRA_CA_CERTS to your CA bundle path in the launchd plist.', {
           url,
@@ -510,12 +472,10 @@ export class AnthropicAgent {
 
     const data = await response.json() as AnthropicResponse;
 
-    // Check for API error in response body
     if (data.error) {
       throw new Error(`Anthropic API error: ${data.error.type} - ${data.error.message}`);
     }
 
-    // Extract text from content blocks
     const textBlock = data.content?.find(block => block.type === 'text');
     if (!textBlock?.text) {
       logger.error('SDK', 'Empty response from Anthropic');
@@ -526,7 +486,6 @@ export class AnthropicAgent {
     const inputTokens = data.usage?.input_tokens;
     const outputTokens = data.usage?.output_tokens;
 
-    // Log actual token usage for cost tracking
     if (inputTokens !== undefined || outputTokens !== undefined) {
       const totalTokens = (inputTokens || 0) + (outputTokens || 0);
 
@@ -548,9 +507,6 @@ export class AnthropicAgent {
     return { content, inputTokens, outputTokens };
   }
 
-  /**
-   * Get Anthropic configuration from settings
-   */
   private getAnthropicConfig(): AnthropicConfig {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
@@ -564,17 +520,17 @@ export class AnthropicAgent {
 }
 
 /**
- * Check if Anthropic is available (has API key or key helper configured)
+ * Anthropic is "available" when either a static API key or a helper script
+ * has been configured. The helper path must exist on disk; if it doesn't, we
+ * treat the provider as unavailable so the worker falls back cleanly.
  */
 export function isAnthropicAvailable(): boolean {
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
-  // Static API key
   if (settings.CLAUDE_MEM_ANTHROPIC_API_KEY) {
     return true;
   }
 
-  // Key helper script exists and is accessible
   const helper = settings.CLAUDE_MEM_ANTHROPIC_API_KEY_HELPER;
   if (helper && existsSync(helper)) {
     return true;
@@ -583,9 +539,6 @@ export function isAnthropicAvailable(): boolean {
   return false;
 }
 
-/**
- * Check if Anthropic is the selected provider
- */
 export function isAnthropicSelected(): boolean {
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
   return settings.CLAUDE_MEM_PROVIDER === 'anthropic';

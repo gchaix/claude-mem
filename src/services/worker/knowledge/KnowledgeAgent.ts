@@ -174,6 +174,11 @@ export class KnowledgeAgent {
 
   private getModelId(): string {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    // Bedrock mode: prefer the Bedrock-format model ID. See ClaudeProvider.getModelId.
+    // Return it raw — a Bedrock model ID/ARN must not go through resolveTierAlias.
+    if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true' && settings.CLAUDE_MEM_BEDROCK_MODEL) {
+      return settings.CLAUDE_MEM_BEDROCK_MODEL;
+    }
     // Resolve $TIER:<fast|smart|simple|summary> aliases at request time (#2289).
     return resolveTierAlias(settings.CLAUDE_MEM_MODEL, settings);
   }

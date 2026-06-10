@@ -1,7 +1,10 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
+import { join, dirname } from 'path';
+import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
 import { paths } from './paths.js';
+import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
 import {
   readClaudeOAuthToken,
   writeStaleMarker,
@@ -15,6 +18,21 @@ import {
 // paths.envFile() unchanged.
 export function envFilePath(): string {
   return process.env.CLAUDE_MEM_ENV_FILE ?? paths.envFile();
+}
+
+// Resolved lazily so CLAUDE_MEM_DATA_DIR (or CLAUDE_MEM_ENV_FILE in tests) set
+// after module load is respected. Production callers see the same path as
+// paths.settings(). When CLAUDE_MEM_ENV_FILE is set to a temp directory (as in
+// the env-isolation test suite), derive settings from the same directory so
+// Bedrock injection reads the test-local settings (which has Bedrock disabled).
+function settingsFilePath(): string {
+  if (process.env.CLAUDE_MEM_DATA_DIR) {
+    return join(process.env.CLAUDE_MEM_DATA_DIR, 'settings.json');
+  }
+  if (process.env.CLAUDE_MEM_ENV_FILE) {
+    return join(dirname(process.env.CLAUDE_MEM_ENV_FILE), 'settings.json');
+  }
+  return join(homedir(), '.claude-mem', 'settings.json');
 }
 
 /** @deprecated Prefer envFilePath(); kept as a snapshot for back-compat. */
@@ -234,6 +252,46 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
       isolatedEnv.OPENROUTER_API_KEY = credentials.OPENROUTER_API_KEY;
     }
 
+    // Inject Bedrock configuration from settings (if enabled).
+    // Settings are authoritative — they persist across daemon restarts regardless
+    // of which session spawned the worker. More reliable than env var inheritance
+    // for a long-lived daemon.
+    const settings = SettingsDefaultsManager.loadFromFile(settingsFilePath());
+    if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true') {
+      isolatedEnv.CLAUDE_CODE_USE_BEDROCK = '1';
+      if (settings.CLAUDE_MEM_BEDROCK_BASE_URL) {
+        isolatedEnv.ANTHROPIC_BEDROCK_BASE_URL = settings.CLAUDE_MEM_BEDROCK_BASE_URL;
+      }
+      if (settings.CLAUDE_MEM_BEDROCK_REGION) {
+        isolatedEnv.AWS_REGION = settings.CLAUDE_MEM_BEDROCK_REGION;
+      }
+      if (settings.CLAUDE_MEM_BEDROCK_MODEL) {
+        isolatedEnv.ANTHROPIC_MODEL = settings.CLAUDE_MEM_BEDROCK_MODEL;
+      }
+      let tokenLoaded = false;
+      if (settings.CLAUDE_MEM_BEDROCK_API_KEY_FILE) {
+        try {
+          const token = readFileSync(settings.CLAUDE_MEM_BEDROCK_API_KEY_FILE, 'utf-8').trim();
+          isolatedEnv.AWS_BEARER_TOKEN_BEDROCK = token;
+          isolatedEnv.ANTHROPIC_AUTH_TOKEN = token;
+          // Do NOT set ANTHROPIC_API_KEY alongside ANTHROPIC_AUTH_TOKEN — Claude Code
+          // treats having both as an auth conflict and warns on every startup.
+          delete isolatedEnv.ANTHROPIC_API_KEY;
+          tokenLoaded = true;
+        } catch (err) {
+          logger.warn('SYSTEM', 'Failed to read Bedrock API key file', {
+            path: settings.CLAUDE_MEM_BEDROCK_API_KEY_FILE
+          }, err as Error);
+        }
+      }
+      logger.info('SYSTEM', 'Bedrock mode active', {
+        baseUrl: settings.CLAUDE_MEM_BEDROCK_BASE_URL || '(default)',
+        region: settings.CLAUDE_MEM_BEDROCK_REGION || '(default)',
+        model: settings.CLAUDE_MEM_BEDROCK_MODEL || '(none)',
+        tokenLoaded,
+      });
+    }
+
     // Note: CLAUDE_CODE_OAUTH_TOKEN is intentionally NOT copied from
     // process.env here. OAuth tokens have refresh semantics that this
     // sync path cannot model — copying a parent-process token captured
@@ -354,6 +412,13 @@ export function hasAnthropicAuthToken(): boolean {
 }
 
 export function getAuthMethodDescription(): string {
+  // Bedrock mode takes precedence when enabled — subscription/API-key auth is
+  // bypassed by the buildIsolatedEnv Bedrock injection path.
+  const settings = SettingsDefaultsManager.loadFromFile(settingsFilePath());
+  if (settings.CLAUDE_MEM_BEDROCK_ENABLED === 'true') {
+    const base = settings.CLAUDE_MEM_BEDROCK_BASE_URL || 'AWS Bedrock';
+    return `Bedrock (${base})`;
+  }
   if (hasAnthropicApiKey()) {
     return 'API key (from ~/.claude-mem/.env)';
   }

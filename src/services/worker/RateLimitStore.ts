@@ -211,13 +211,21 @@ export function shouldAbortForQuota(
 }
 
 /**
- * Detects API-key auth from a free-form auth-method label. Matches the
+ * Detects per-call-billing auth from a free-form auth-method label. Matches the
  * verbose strings produced by `getAuthMethodDescription()` (e.g.
  * "API key (from ~/.claude-mem/.env)") as well as concise tokens like
  * "api_key".
+ *
+ * Bedrock counts as per-call billing too: the `rate_limit` system events this
+ * guard reacts to are Claude *subscription* quota signals (five_hour/seven_day
+ * buckets) that do not apply to a Bedrock endpoint. A Bedrock user authorized
+ * per-call spend, so they must be exempt from the subscription-quota abort the
+ * same way an API-key user is. getAuthMethodDescription() returns "Bedrock (...)"
+ * when Bedrock mode is enabled.
  */
 export function isApiKeyAuth(authMethod: string): boolean {
   if (!authMethod) return false;
   const normalized = authMethod.toLowerCase();
-  return normalized.startsWith('api key') || normalized === 'api_key';
+  return normalized.startsWith('api key') || normalized === 'api_key'
+    || normalized.startsWith('bedrock');
 }

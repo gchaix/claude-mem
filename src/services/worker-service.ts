@@ -1,6 +1,7 @@
 
 import path from 'path';
 import { existsSync } from 'fs';
+import { homedir } from 'os';
 import { spawn } from 'child_process';
 import { Database } from 'bun:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -995,6 +996,18 @@ async function main() {
 
     case '--daemon':
     default: {
+      // Pin cwd to $HOME regardless of how the daemon was launched.
+      // spawnDaemon() already passes cwd: homedir(), but this protects against
+      // developer/operator paths that invoke --daemon directly from arbitrary
+      // shells. Without a known-good cwd, a later deletion of the inherited
+      // directory (worktree cleanup etc.) breaks every child_process call in
+      // the worker and surfaces as misleading "executable not found" errors.
+      try {
+        process.chdir(homedir());
+      } catch (err) {
+        logger.warn('SYSTEM', 'Failed to chdir to homedir at daemon start', {}, err instanceof Error ? err : new Error(String(err)));
+      }
+
       const existingPidInfo = readPidFile();
       if (verifyPidFileOwnership(existingPidInfo)) {
         logger.info('SYSTEM', 'Worker already running (PID alive), refusing to start duplicate', {

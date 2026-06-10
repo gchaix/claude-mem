@@ -15,7 +15,7 @@ import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
 import { PrivacyCheckValidator } from '../../validation/PrivacyCheckValidator.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
+import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_PROJECT } from '../../../../shared/paths.js';
 import { getProjectContext } from '../../../../utils/project-name.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { handleGeneratorExit } from '../../session/GeneratorExitHandler.js';
@@ -316,6 +316,16 @@ export class SessionRoutes extends BaseRouteHandler {
     const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : undefined;
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const customTitle = req.body.customTitle || undefined;
+
+    // Server-side guard: reject observer-sessions before creating DB rows.
+    // The hook layer normally filters these via shouldTrackProject(), but
+    // outdated hooks or unset env vars bypass that check and flood the
+    // queue with observer-on-observer loops. Reject at the HTTP boundary
+    // so a single stale hook can't generate thousands of rows.
+    if (project === OBSERVER_SESSIONS_PROJECT) {
+      res.json({ skipped: true, reason: 'observer_session' });
+      return;
+    }
 
     if (rawPrompt && isInternalProtocolPayload(rawPrompt)) {
       logger.debug('HTTP', 'session-init: skipping internal protocol payload before session creation', { contentSessionId });

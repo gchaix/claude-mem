@@ -1147,7 +1147,7 @@ export class MigrationRunner {
   }
 
   /**
-   * Migration 35: create offline_event_queue for durable buffering of
+   * Migration 36: create offline_event_queue for durable buffering of
    * server-beta hook events when the remote worker is unreachable. This table
    * has no foreign-key dependencies so it can be written from hook processes
    * without any other infrastructure running.
@@ -1155,7 +1155,7 @@ export class MigrationRunner {
   private createOfflineEventQueue(): void {
     const applied = this.db.prepare(
       'SELECT version FROM schema_versions WHERE version = ?'
-    ).get(35) as { version: number } | undefined;
+    ).get(36) as { version: number } | undefined;
     if (applied) return;
 
     this.db.run(`
@@ -1176,8 +1176,8 @@ export class MigrationRunner {
 
     this.db.prepare(
       'INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)'
-    ).run(35, new Date().toISOString());
+    ).run(36, new Date().toISOString());
 
-    logger.debug('DB', 'Migration 35: created offline_event_queue table');
+    logger.debug('DB', 'Migration 36: created offline_event_queue table');
   }
 }

@@ -1,7 +1,4 @@
-// IO discipline (see src/shared/hook-io.ts): this handler is PURE. It returns a
-// HookResult and MUST NOT call process.stderr.write / process.stdout.write /
-// console.* / process.exit. logger.* calls are DIAGNOSTIC; thrown errors are
-// caught by hookCommand and routed through emitBlockingError.
+
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
@@ -10,6 +7,8 @@ import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
 import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
+import { OfflineEventQueue } from '../../services/sqlite/OfflineEventQueue.js';
+import { drainOfflineQueue } from '../../services/hooks/offline-drain.js';
 
 async function dispatchToWorker(
   input: NormalizedHookInput,
@@ -62,29 +61,34 @@ export const observationHandler: EventHandler = {
 
     const runtime = resolveRuntimeContext();
     if (runtime.runtime === 'server-beta') {
+      const eventPayload = {
+        contentSessionId: sessionId,
+        occurredAtEpoch: Date.now(),
+        payload: {
+          tool_name: toolName,
+          tool_input: toolInput,
+          tool_response: toolResponse,
+          cwd,
+          agentId: input.agentId,
+          agentType: input.agentType,
+          platformSource,
+        },
+      };
       try {
+        await drainOfflineQueue(runtime);
         await runtime.client.recordEvent({
           projectId: runtime.projectId,
-          contentSessionId: sessionId,
           sourceType: 'hook',
           eventType: 'tool_use',
-          occurredAtEpoch: Date.now(),
-          payload: {
-            tool_name: toolName,
-            tool_input: toolInput,
-            tool_response: toolResponse,
-            cwd,
-            agentId: input.agentId,
-            agentType: input.agentType,
-            platformSource,
-          },
+          ...eventPayload,
         });
         logger.debug('HOOK', 'Observation sent successfully via server-beta', { toolName });
         return { continue: true, suppressOutput: true };
       } catch (error: unknown) {
         if (isServerBetaClientError(error) && error.isFallbackEligible()) {
           logServerBetaFallback(error.kind, { status: error.status, message: error.message, route: '/v1/events' });
-          // fall through to worker fallback
+          OfflineEventQueue.shared().enqueue('tool_use', eventPayload);
+          return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
         } else {
           logger.error('HOOK', 'Server beta event failed (non-recoverable)', {
             error: error instanceof Error ? error.message : String(error),

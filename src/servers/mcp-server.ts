@@ -263,20 +263,32 @@ async function handleObservationAdd(
   args: ObservationAddArgs,
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   try {
-    const ctx = requireServerBetaForObservationTool('observation_add');
     if (typeof args?.content !== 'string' || args.content.trim().length === 0) {
       throw new Error('observation_add: "content" is required');
     }
-    const projectId = args.projectId && args.projectId.trim().length > 0 ? args.projectId : ctx.projectId;
-    const request: ServerBetaAddObservationRequest = {
-      projectId,
-      content: args.content,
-      ...(args.serverSessionId !== undefined ? { serverSessionId: args.serverSessionId } : {}),
-      ...(args.kind !== undefined ? { kind: args.kind } : {}),
+
+    const resolution = resolveServerBetaToolContext();
+
+    // Server-beta path: forward to /v1/memories
+    if (resolution?.available) {
+      const projectId = args.projectId && args.projectId.trim().length > 0 ? args.projectId : resolution.projectId;
+      const request: ServerBetaAddObservationRequest = {
+        projectId,
+        content: args.content,
+        ...(args.serverSessionId !== undefined ? { serverSessionId: args.serverSessionId } : {}),
+        ...(args.kind !== undefined ? { kind: args.kind } : {}),
+        ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
+      };
+      const response = await resolution.client.addObservation(request);
+      return formatJsonResult(response);
+    }
+
+    // Worker-mode path: forward to /api/memory/save on the connected worker
+    return await callWorkerAPIPost('/api/memory/save', {
+      text: args.content,
+      ...(args.projectId && args.projectId.trim().length > 0 ? { project: args.projectId } : {}),
       ...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
-    };
-    const response = await ctx.client.addObservation(request);
-    return formatJsonResult(response);
+    });
   } catch (error) {
     return formatToolError(error);
   }

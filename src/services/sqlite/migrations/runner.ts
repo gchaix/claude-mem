@@ -38,6 +38,7 @@ export class MigrationRunner {
     this.dropWorkerPidColumn();
     this.createServerOwnedTables();
     this.rebuildPendingMessagesForFinalQueueSchema();
+    this.createOfflineEventQueue();
   }
 
   private initializeSchema(): void {
@@ -1124,5 +1125,40 @@ export class MigrationRunner {
       }
       throw new Error(`Migration 34 failed: ${String(error)}`);
     }
+  }
+
+  /**
+   * Migration 35: create offline_event_queue for durable buffering of
+   * server-beta hook events when the remote worker is unreachable. This table
+   * has no foreign-key dependencies so it can be written from hook processes
+   * without any other infrastructure running.
+   */
+  private createOfflineEventQueue(): void {
+    const applied = this.db.prepare(
+      'SELECT version FROM schema_versions WHERE version = ?'
+    ).get(35) as { version: number } | undefined;
+    if (applied) return;
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS offline_event_queue (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type         TEXT    NOT NULL,
+        occurred_at_epoch  INTEGER NOT NULL,
+        payload            TEXT    NOT NULL,
+        attempt_count      INTEGER NOT NULL DEFAULT 0,
+        last_attempt_epoch INTEGER,
+        last_error         TEXT
+      )
+    `);
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_offline_event_queue_epoch
+        ON offline_event_queue(occurred_at_epoch ASC)
+    `);
+
+    this.db.prepare(
+      'INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)'
+    ).run(35, new Date().toISOString());
+
+    logger.debug('DB', 'Migration 35: created offline_event_queue table');
   }
 }

@@ -1,7 +1,4 @@
-// IO discipline (see src/shared/hook-io.ts): this handler is PURE. It returns a
-// HookResult and MUST NOT call process.stderr.write / process.stdout.write /
-// console.* / process.exit. logger.* calls are DIAGNOSTIC; thrown errors are
-// caught by hookCommand and routed through emitBlockingError.
+
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { getProjectContext } from '../../utils/project-name.js';
@@ -13,6 +10,8 @@ import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { isInternalProtocolPayload } from '../../utils/tag-stripping.js';
 import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
 import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
+import { OfflineEventQueue } from '../../services/sqlite/OfflineEventQueue.js';
+import { drainOfflineQueue } from '../../services/hooks/offline-drain.js';
 
 interface SessionInitResponse {
   sessionDbId: number;
@@ -56,15 +55,19 @@ export const sessionInitHandler: EventHandler = {
 
     const runtime = resolveRuntimeContext();
     if (runtime.runtime === 'server-beta') {
+      const startPayload = {
+        externalSessionId: sessionId,
+        contentSessionId: sessionId,
+        agentId: input.agentId ?? null,
+        agentType: input.agentType ?? null,
+        platformSource,
+        metadata: { project, prompt },
+      };
       try {
+        await drainOfflineQueue(runtime);
         await runtime.client.startSession({
           projectId: runtime.projectId,
-          externalSessionId: sessionId,
-          contentSessionId: sessionId,
-          agentId: input.agentId ?? null,
-          agentType: input.agentType ?? null,
-          platformSource,
-          metadata: { project, prompt },
+          ...startPayload,
         });
         logger.info('HOOK', 'session-init: server-beta session started', {
           contentSessionId: sessionId,
@@ -81,7 +84,8 @@ export const sessionInitHandler: EventHandler = {
             message: error.message,
             route: '/v1/sessions/start',
           });
-          // fall through to worker fallback
+          OfflineEventQueue.shared().enqueue('session_start', startPayload);
+          return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
         } else {
           logger.error('HOOK', 'Server beta session-start failed (non-recoverable)', {
             error: error instanceof Error ? error.message : String(error),

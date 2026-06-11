@@ -147,7 +147,9 @@ If a <parameters> or <outcome> block above contains an "<elided chars=... />" ma
 
 Return either one or more <observation>...</observation> blocks, or an empty response if this tool use should be skipped.
 Concrete debugging findings from logs, queue state, database rows, session routing, or code-path inspection count as durable discoveries and should be recorded.
-Never reply with prose such as "Skipping", "No substantive tool executions", or any explanation outside XML. Non-XML text is discarded.`;
+Never reply with prose such as "Skipping", "No substantive tool executions", or any explanation outside XML. Non-XML text is discarded.
+
+GROUNDING RULE: Every fact, title, and narrative you write MUST be derived ONLY from the <parameters> and <outcome> content above. Do NOT infer technology names, implementation patterns, or outcomes that are not explicitly stated in those fields. A file path like "/auth/auth.py" is just a path — it does not mean OAuth2 was implemented. Only record what the output text actually shows was done.`;
 }
 
 export function buildSummaryPrompt(session: SDKSession, mode: ModeConfig): string {

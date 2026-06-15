@@ -32,6 +32,7 @@ export type Component =
   | 'IMPORT'
   | 'INGEST'
   | 'OAUTH'
+  | 'OFFLINE_QUEUE'
   | 'OPENCLAW'
   | 'OPENCODE'
   | 'PARSER'

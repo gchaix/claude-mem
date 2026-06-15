@@ -7,7 +7,9 @@ import { SettingsDefaultsManager, type SettingsDefaults } from "./SettingsDefaul
 import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
 import { validateWorkerPidFile } from "../supervisor/index.js";
-import { emitBlockingError } from "./hook-io.js";
+// Type-only: the value is lazy-imported inside the offline-queue helpers so
+// bun:sqlite never enters the eager graph of node-run bundles (mcp-server).
+import type { OfflineEventQueue } from "../services/sqlite/OfflineEventQueue.js";
 import { captureCliEvent } from "../services/telemetry/cli-telemetry.js";
 import { checkVersionMatch } from "../services/infrastructure/index.js";
 // Imported from ProcessManager.js directly (not the infrastructure barrel):
@@ -588,14 +590,10 @@ export async function recordWorkerUnreachable(): Promise<number> {
   const threshold = getFailLoudThreshold();
   if (next.consecutiveFailures >= threshold) {
     // hook_failed distress signal. Gated to the failure that JUST reached the
-    // threshold (`===`, not `>=`): the stderr warning below repeats on every
-    // failure past the threshold, but telemetry emits once per failure streak
-    // to bound volume. MUST be awaited BEFORE emitBlockingError — it calls
-    // process.exit(2) immediately, which would kill a fire-and-forget POST
-    // mid-flight. captureCliEvent never throws and is hard-capped at 2s, so
-    // this cannot hang the fail-loud path. Closed-enum/count props only —
-    // never error text. Transport is the direct CLI POST, never the worker
-    // API (the defining failure here IS "worker unreachable").
+    // threshold (`===`, not `>=`) to bound telemetry volume to once per streak.
+    // Closed-enum/count props only — never error text. Transport is the direct
+    // CLI POST, never the worker API (the defining failure here IS "worker
+    // unreachable").
     if (next.consecutiveFailures === threshold) {
       await captureCliEvent('hook_failed', {
         ...(activeHookType !== null ? { hook_type: activeHookType } : {}),
@@ -604,12 +602,15 @@ export async function recordWorkerUnreachable(): Promise<number> {
         threshold_tripped: true,
       });
     }
-    // #2292 fix: BLOCKING_FEEDBACK. emitBlockingError flushes the Phase 2
-    // stderr buffer (so preceding logger.warn lines also surface) and writes
-    // via the bypass channel + exits 2. Previously this raw process.stderr.write
-    // was swallowed by hookCommand's blanket no-op, so the user/model never saw it.
-    emitBlockingError(
-      `claude-mem worker unreachable for ${next.consecutiveFailures} consecutive hooks.`
+    // tag1 (worker-path offline queue): downgraded from a blocking exit(2) to a
+    // non-blocking warning. Worker-path write events are now durably buffered in
+    // the offline queue (see executeWithWorkerFallback) and replayed on
+    // reconnect, so a sonic outage must never interrupt the session. The counter
+    // keeps incrementing so a persistently-down worker stays visible in the
+    // logs; only the hook-blocking escalation is removed.
+    logger.warn(
+      'SYSTEM',
+      `claude-mem worker unreachable for ${next.consecutiveFailures} consecutive hooks; events buffered, will retry on reconnect.`
     );
   }
   return next.consecutiveFailures;
@@ -639,6 +640,83 @@ export interface WorkerFallbackOptions {
   timeoutMs?: number;
 }
 
+// tag1 worker-path offline queue ------------------------------------------------
+//
+// When the remote worker is unreachable (or returns a transient 429/5xx), the
+// session-write events below are buffered locally and replayed verbatim on the
+// next successful contact. Reads (context/search) and permanent 4xx are NOT
+// buffered. Matches the server-beta offline-queue semantics; no dedup or drain
+// lock (a rare duplicate after an outage is accepted, as on the server-beta
+// path). The queue self-creates its table, so thin clients need no migration.
+const REPLAYABLE_WORKER_PATHS = new Set<string>([
+  '/api/sessions/init',
+  '/api/sessions/observations',
+  '/api/sessions/summarize',
+]);
+
+function isReplayableWorkerCall(url: string, method: string): boolean {
+  return method === 'POST' && REPLAYABLE_WORKER_PATHS.has(url);
+}
+
+async function enqueueOfflineWorkerCall(url: string, method: string, body: unknown): Promise<void> {
+  try {
+    const { OfflineEventQueue } = await import("../services/sqlite/OfflineEventQueue.js");
+    OfflineEventQueue.shared().enqueue('worker_http', { url, method, body });
+  } catch (err) {
+    // Buffering is best-effort; never let a queue error break the hook.
+    logger.warn('OFFLINE_QUEUE', 'Failed to buffer offline worker event', {
+      url,
+    }, err instanceof Error ? err : new Error(String(err)));
+  }
+}
+
+// Replay buffered worker_http events oldest-first. Called after a confirmed
+// successful worker contact (so the worker is known reachable). Stops on the
+// first transient failure (leaves rows for next time); increments the attempt
+// counter on permanent 4xx so a poison row is abandoned after MAX_ATTEMPTS.
+async function drainWorkerOfflineQueue(): Promise<void> {
+  let queue: OfflineEventQueue;
+  try {
+    const mod = await import("../services/sqlite/OfflineEventQueue.js");
+    queue = mod.OfflineEventQueue.shared();
+    if (queue.pendingCount() === 0) return;
+  } catch {
+    return;
+  }
+  const events = queue.peekDeliverable(50).filter(e => e.event_type === 'worker_http');
+  for (const ev of events) {
+    let req: { url: string; method: string; body?: unknown };
+    try {
+      req = JSON.parse(ev.payload);
+    } catch {
+      queue.markFailed(ev.id, 'unparseable worker_http payload');
+      continue;
+    }
+    try {
+      const init: { method: string; headers?: Record<string, string>; body?: string } = {
+        method: req.method,
+      };
+      if (req.body !== undefined) {
+        init.headers = { 'Content-Type': 'application/json' };
+        init.body = JSON.stringify(req.body);
+      }
+      const resp = await workerHttpRequest(req.url, init);
+      if (resp.ok) {
+        queue.markDelivered(ev.id);
+      } else if (resp.status === 429 || resp.status >= 500) {
+        // Transient: stop draining, retry the whole batch next time.
+        break;
+      } else {
+        // Permanent client error: count the attempt and move on.
+        queue.markFailed(ev.id, `worker_api_${resp.status}`);
+      }
+    } catch {
+      // Transport error — the worker went away mid-drain; stop.
+      break;
+    }
+  }
+}
+
 export async function executeWithWorkerFallback<T = unknown>(
   url: string,
   method: 'GET' | 'POST' | 'PUT' | 'DELETE',
@@ -648,6 +726,9 @@ export async function executeWithWorkerFallback<T = unknown>(
   const alive = await ensureWorkerAliveOnce();
   if (!alive) {
     await recordWorkerUnreachable();
+    if (isReplayableWorkerCall(url, method)) {
+      await enqueueOfflineWorkerCall(url, method, body);
+    }
     return { continue: true, reason: 'worker_unreachable', [WORKER_FALLBACK_BRAND]: true };
   }
 
@@ -668,6 +749,9 @@ export async function executeWithWorkerFallback<T = unknown>(
       logger.warn('SYSTEM', `Worker API ${method} ${url} returned ${response.status}; skipping hook API call`, {
         body: text.substring(0, 200),
       });
+      if (isReplayableWorkerCall(url, method)) {
+        await enqueueOfflineWorkerCall(url, method, body);
+      }
       return {
         continue: true,
         reason: `worker_api_${response.status}`,
@@ -681,6 +765,11 @@ export async function executeWithWorkerFallback<T = unknown>(
   }
 
   resetWorkerFailureCounter();
+  // Worker is confirmed reachable; replay any buffered write events. Best-effort
+  // and gated to write calls so read hooks (context/search) skip the queue open.
+  if (isReplayableWorkerCall(url, method)) {
+    await drainWorkerOfflineQueue();
+  }
   const text = await response.text();
   if (text.length === 0) return undefined as unknown as T;
   try {

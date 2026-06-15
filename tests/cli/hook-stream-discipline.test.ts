@@ -14,8 +14,9 @@ import type { HookResult } from '../../src/cli/types.js';
 // Windows Terminal tab-accumulation rationale (per CLAUDE.md):
 // The exit-0-on-error policy is intentional — non-zero exits keep Windows
 // Terminal tabs open. exitGraceful() exits 0 and drops buffered stderr for the
-// transient worker-unavailable path. emitBlockingError() exits 2 only for the
-// fail-loud counter (recordWorkerUnreachable) and unrecoverable handler errors.
+// transient worker-unavailable path. emitBlockingError() exits 2 only for
+// unrecoverable handler errors (the tag1 fail-loud counter no longer blocks —
+// worker-path events are buffered in the offline queue and replayed).
 //
 // These tests assert the IO-discipline CONTRACT at the seam level rather than
 // spawning the built worker daemon, because worker-service auto-spawns a Bun
@@ -39,8 +40,8 @@ afterEach(() => resetHookIoState());
 describe('#2292 — fail-loud diagnostic is no longer swallowed', () => {
   it('emitBlockingError surfaces the worker-unreachable message through the buffered window', () => {
     // Simulate hookCommand: install the stderr buffer that previously swallowed
-    // EVERYTHING (the #2292 no-op). recordWorkerUnreachable now calls
-    // emitBlockingError, which must bypass the buffer and reach real stderr.
+    // EVERYTHING (the #2292 no-op). emitBlockingError (still used for
+    // unrecoverable handler errors) must bypass the buffer and reach real stderr.
     const real = captureRealStderr();
     const buffer = installHookStderrBuffer();
     try {
@@ -58,10 +59,15 @@ describe('#2292 — fail-loud diagnostic is no longer swallowed', () => {
     }
   });
 
-  it('worker-utils recordWorkerUnreachable routes through emitBlockingError (source contract)', () => {
+  it('worker-utils recordWorkerUnreachable emits a non-blocking warning, never a blocking exit (tag1 offline-queue contract)', () => {
     const src = readFileSync(join(REPO_ROOT, 'src', 'shared', 'worker-utils.ts'), 'utf-8');
-    // The fail-loud branch must NOT call process.stderr.write / process.exit directly.
-    expect(src).toContain('emitBlockingError(');
+    // tag1 worker-path offline queue: write events are buffered locally and
+    // replayed on reconnect, so a worker outage must NOT block the hook. The
+    // fail-loud branch surfaces a non-blocking logger.warn instead of
+    // emitBlockingError (which exits 2). It must also not exit/stderr-write
+    // directly for this path.
+    expect(src).not.toContain('emitBlockingError(');
+    expect(src).toContain('events buffered, will retry on reconnect');
     expect(src).not.toMatch(/process\.stderr\.write\(\s*\n\s*`claude-mem worker unreachable/);
   });
 });

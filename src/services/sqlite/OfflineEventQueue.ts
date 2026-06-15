@@ -20,7 +20,12 @@ export type OfflineEventType =
   | 'session_start'
   | 'tool_use'
   | 'assistant_message'
-  | 'session_end';
+  | 'session_end'
+  // Worker-path durability (tag1): a buffered worker HTTP request, stored as
+  // { url, method, body } and replayed verbatim via workerHttpRequest on
+  // reconnect. Distinct from the server-beta event types above so the two
+  // drains never parse each other's rows (a machine is only ever one runtime).
+  | 'worker_http';
 
 export interface OfflineEvent {
   id: number;

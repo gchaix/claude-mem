@@ -15,7 +15,8 @@ describe('Version Consistency', () => {
     
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
     expect(packageJson.version).toBeDefined();
-    expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+$/);
+    // Accept an optional semver pre-release suffix (the tag1 fork ships e.g. 13.6.1-tag1.1).
+    expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
     
     rootVersion = packageJson.version;
   });
@@ -79,9 +80,10 @@ describe('Version Consistency', () => {
   });
 
   it('should validate version format is semver compliant', () => {
-    expect(rootVersion).toMatch(/^\d+\.\d+\.\d+$/);
-    
-    const [major, minor, patch] = rootVersion.split('.').map(Number);
+    expect(rootVersion).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
+
+    // Parse the numeric core, ignoring any pre-release suffix (e.g. "-tag1.1").
+    const [major, minor, patch] = rootVersion.split('-')[0].split('.').map(Number);
     expect(major).toBeGreaterThanOrEqual(0);
     expect(minor).toBeGreaterThanOrEqual(0);
     expect(patch).toBeGreaterThanOrEqual(0);

@@ -5,6 +5,7 @@ import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { getHostname } from '../../shared/hostname.js';
+import { shouldTrackProject } from '../../shared/should-track-project.js';
 
 export const fileEditHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
@@ -22,6 +23,11 @@ export const fileEditHandler: EventHandler = {
 
     if (!cwd) {
       throw new Error(`Missing cwd in FileEdit hook input for session ${sessionId}, file ${filePath}`);
+    }
+
+    if (!shouldTrackProject(cwd)) {
+      logger.debug('HOOK', 'Project excluded from tracking, skipping file edit observation', { cwd, filePath });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
     const result = await executeWithWorkerFallback<{ status?: string }>(

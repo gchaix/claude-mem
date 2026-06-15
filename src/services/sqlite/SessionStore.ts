@@ -73,6 +73,28 @@ export class SessionStore {
     this.dropDeadPendingMessagesColumns();
     this.ensurePendingMessagesToolUseIdColumn();
     this.dropWorkerPidColumn();
+    this.addSessionHostnameColumn();
+  }
+
+  // Migration 37: add nullable hostname column to sdk_sessions. Mirrors
+  // MigrationRunner.addSessionHostnameColumn so DBs opened directly via the
+  // SessionStore constructor (tests, and any code path that does not route
+  // through DatabaseManager/MigrationRunner) get the column too. Idempotent:
+  // guarded on both schema_versions and the live column set.
+  private addSessionHostnameColumn(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(37) as SchemaVersion | undefined;
+
+    const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'hostname');
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE sdk_sessions ADD COLUMN hostname TEXT');
+      logger.debug('DB', 'Migration 37: added hostname column to sdk_sessions table');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(37, new Date().toISOString());
   }
 
   private dropWorkerPidColumn(): void {

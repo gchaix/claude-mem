@@ -6,9 +6,10 @@ import type { GetObservationsByIdsOptions, ObservationSessionRow } from './types
 
 export function getObservationById(db: Database, id: number): ObservationRecord | null {
   const stmt = db.prepare(`
-    SELECT *
-    FROM observations
-    WHERE id = ?
+    SELECT o.*, s.hostname as hostname
+    FROM observations o
+    LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id
+    WHERE o.id = ?
   `);
 
   return stmt.get(id) as ObservationRecord | undefined || null;
@@ -66,14 +67,15 @@ export function getObservationsByIds(
   }
 
   const whereClause = additionalConditions.length > 0
-    ? `WHERE id IN (${placeholders}) AND ${additionalConditions.join(' AND ')}`
-    : `WHERE id IN (${placeholders})`;
+    ? `WHERE o.id IN (${placeholders}) AND ${additionalConditions.join(' AND ')}`
+    : `WHERE o.id IN (${placeholders})`;
 
   const stmt = db.prepare(`
-    SELECT *
-    FROM observations
+    SELECT o.*, s.hostname as hostname
+    FROM observations o
+    LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id
     ${whereClause}
-    ORDER BY created_at_epoch ${orderClause}
+    ORDER BY o.created_at_epoch ${orderClause}
     ${limitClause}
   `);
 
@@ -96,29 +98,14 @@ export function getObservationsForSession(
 
 export function getObservationsByFilePath(
   db: Database,
-  filePath: string | string[],
+  filePath: string,
   options?: { projects?: string[]; limit?: number }
 ): ObservationRecord[] {
   const rawLimit = options?.limit;
   const limit = Number.isInteger(rawLimit) && (rawLimit as number) > 0
     ? Math.min(rawLimit as number, 100)
     : 15;
-
-  // #2691 — PreToolUse:Read and PostToolUse can disagree on the stored path
-  // form (absolute vs project-root-relative vs cwd-relative). Accept multiple
-  // candidate path forms and match observations whose files_read/files_modified
-  // contain ANY of them, so context injection keyed on path is consistent
-  // across the two events. De-duplicate to keep the IN() clause minimal.
-  const candidatePaths = Array.from(
-    new Set((Array.isArray(filePath) ? filePath : [filePath]).filter(p => typeof p === 'string' && p.length > 0))
-  );
-  if (candidatePaths.length === 0) {
-    return [];
-  }
-
-  const pathPlaceholders = candidatePaths.map(() => '?').join(',');
-  // Params order mirrors the two json_each subqueries (files_read, then files_modified).
-  const params: (string | number)[] = [...candidatePaths, ...candidatePaths];
+  const params: (string | number)[] = [filePath, filePath];
 
   let projectClause = '';
   if (options?.projects?.length) {
@@ -133,8 +120,8 @@ export function getObservationsByFilePath(
     SELECT *
     FROM observations
     WHERE (
-      (files_read LIKE '[%' AND EXISTS (SELECT 1 FROM json_each(files_read) WHERE value IN (${pathPlaceholders})))
-      OR (files_modified LIKE '[%' AND EXISTS (SELECT 1 FROM json_each(files_modified) WHERE value IN (${pathPlaceholders})))
+      (files_read LIKE '[%' AND EXISTS (SELECT 1 FROM json_each(files_read) WHERE value = ?))
+      OR (files_modified LIKE '[%' AND EXISTS (SELECT 1 FROM json_each(files_modified) WHERE value = ?))
     )
     ${projectClause}
     ORDER BY created_at_epoch DESC

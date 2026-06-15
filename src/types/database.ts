@@ -34,6 +34,7 @@ export interface ObservationRecord {
   concept?: string;
   prompt_number?: number;
   discovery_tokens?: number;
+  hostname?: string | null;
 }
 
 export interface SessionSummaryRecord {
@@ -68,6 +69,7 @@ export interface LatestPromptResult {
   memory_session_id: string;
   project: string;
   platform_source: string;
+  hostname?: string | null;
   prompt_number: number;
   prompt_text: string;
   created_at_epoch: number;

@@ -4,12 +4,13 @@ import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker
 import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
-import { shouldTrackProject } from '../../shared/should-track-project.js';
+import { getHostname } from '../../shared/hostname.js';
 
 export const fileEditHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     const { sessionId, cwd, filePath, edits } = input;
     const platformSource = normalizePlatformSource(input.platform);
+    const hostname = getHostname();
 
     if (!filePath) {
       throw new Error('fileEditHandler requires filePath');
@@ -23,17 +24,13 @@ export const fileEditHandler: EventHandler = {
       throw new Error(`Missing cwd in FileEdit hook input for session ${sessionId}, file ${filePath}`);
     }
 
-    if (!shouldTrackProject(cwd)) {
-      logger.debug('HOOK', 'Project excluded from tracking, skipping file edit observation', { cwd, filePath });
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const result = await executeWithWorkerFallback<{ status?: string }>(
       '/api/sessions/observations',
       'POST',
       {
         contentSessionId: sessionId,
         platformSource,
+        hostname,
         tool_name: 'write_file',
         tool_input: { filePath, edits },
         tool_response: { success: true },

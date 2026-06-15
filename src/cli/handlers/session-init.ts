@@ -7,6 +7,7 @@ import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { loadFromFileOnce } from '../../shared/hook-settings.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { getHostname } from '../../shared/hostname.js';
 import { isInternalProtocolPayload } from '../../utils/tag-stripping.js';
 import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
 import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
@@ -52,6 +53,7 @@ export const sessionInitHandler: EventHandler = {
 
     const project = getProjectContext(cwd).primary;
     const platformSource = normalizePlatformSource(input.platform);
+    const hostname = getHostname();
 
     const runtime = resolveRuntimeContext();
     if (runtime.runtime === 'server-beta') {
@@ -61,6 +63,7 @@ export const sessionInitHandler: EventHandler = {
         agentId: input.agentId ?? null,
         agentType: input.agentType ?? null,
         platformSource,
+        hostname,
         metadata: { project, prompt },
       };
       try {
@@ -105,6 +108,7 @@ export const sessionInitHandler: EventHandler = {
         project,
         prompt,
         platformSource,
+        hostname,
       },
     );
 

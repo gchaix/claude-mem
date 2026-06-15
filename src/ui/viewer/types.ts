@@ -4,6 +4,7 @@ export interface Observation {
   project: string;
   merged_into_project?: string | null;
   platform_source: string;
+  hostname?: string | null;
   type: string;
   title: string | null;
   subtitle: string | null;
@@ -23,6 +24,7 @@ export interface Summary {
   session_id: string;
   project: string;
   platform_source: string;
+  hostname?: string | null;
   request?: string;
   investigated?: string;
   learned?: string;

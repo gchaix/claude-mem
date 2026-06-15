@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS sdk_sessions (
   memory_session_id   TEXT    UNIQUE,
   project             TEXT    NOT NULL,
   platform_source     TEXT    NOT NULL DEFAULT 'claude',
+  hostname            TEXT,
   user_prompt         TEXT,
   started_at          TEXT    NOT NULL,
   started_at_epoch    INTEGER NOT NULL,

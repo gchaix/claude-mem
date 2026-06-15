@@ -1,5 +1,6 @@
 
 import type { Response } from 'express';
+import type { RestartGuard } from './worker/RestartGuard.js';
 
 export interface ConversationMessage {
   role: 'user' | 'assistant';
@@ -8,10 +9,11 @@ export interface ConversationMessage {
 
 export interface ActiveSession {
   sessionDbId: number;
-  contentSessionId: string;      
-  memorySessionId: string | null; 
+  contentSessionId: string;
+  memorySessionId: string | null;
   project: string;
   platformSource: string;
+  hostname?: string | null;
   userPrompt: string;
   pendingMessages: PendingMessage[];  
   abortController: AbortController;
@@ -23,23 +25,17 @@ export interface ActiveSession {
   earliestPendingTimestamp: number | null;  
   claimedMessageIds: number[];
   conversationHistory: ConversationMessage[];  
-  currentProvider: 'claude' | 'gemini' | 'openrouter' | null;
-  consecutiveRestarts: number;
-  /**
-   * Consecutive non-XML (idle/prose/poisoned) observer outputs. Reset to 0 on a
-   * valid parse. When it reaches the recovery threshold the SDK session is
-   * killed and respawned so a poisoned session can't wedge the pipeline at zero
-   * (plan-11, #2485).
-   */
-  consecutiveInvalidOutputs: number;
-  forceInit?: boolean;
+  currentProvider: 'claude' | 'gemini' | 'openrouter' | null;  
+  consecutiveRestarts: number;  
+  restartGuard?: RestartGuard;
+  forceInit?: boolean;  
   idleTimedOut?: boolean;  
   lastGeneratorActivity: number;
   modelOverride?: string;
   lastSummaryStored?: boolean;
   pendingAgentId?: string | null;
   pendingAgentType?: string | null;
-  abortReason?: 'idle' | 'shutdown' | 'overflow' | 'restart-guard' | 'quota' | string | null;
+  abortReason?: 'idle' | 'shutdown' | 'overflow' | 'restart-guard' | 'quota' | 'rate-limit' | string | null;
   respawnTimer?: ReturnType<typeof setTimeout>;
   /** When the latest compression prompt was dispatched to the model — telemetry compression_ms. */
   lastPromptSentAt?: number | null;
@@ -60,6 +56,15 @@ export interface ActiveSession {
   pendingCompressionEvent?: Record<string, unknown> | null;
   /** Cumulative total_cost_usd from the SDK's latest result message — per-compression cost is the delta between results. */
   lastResultTotalCostUsd?: number | null;
+  // Rate-limit resilience: when the generator exits because the provider is
+  // rate-limited or transiently overloaded, we want a longer, guard-bypassing
+  // backoff that preserves pending work. retryAfterMs carries the provider's
+  // Retry-After hint when one was supplied; rateLimitBackoffCount is the number
+  // of consecutive rate-limit restarts since the last successful processing,
+  // used to compute an exponential schedule (30s -> 60s -> 120s -> 300s cap) when
+  // retryAfterMs is absent. Both reset to zero on the next successful run.
+  retryAfterMs?: number;
+  rateLimitBackoffCount?: number;
 }
 
 export interface PendingMessage {
@@ -121,10 +126,11 @@ export interface ViewerSettings {
 
 export interface Observation {
   id: number;
-  memory_session_id: string;  
+  memory_session_id: string;
   project: string;
   merged_into_project: string | null;
   platform_source: string;
+  hostname?: string | null;
   type: string;
   title: string;
   subtitle: string | null;
@@ -141,9 +147,10 @@ export interface Observation {
 
 export interface Summary {
   id: number;
-  session_id: string; 
+  session_id: string;
   project: string;
   platform_source: string;
+  hostname?: string | null;
   request: string | null;
   investigated: string | null;
   learned: string | null;
@@ -156,9 +163,10 @@ export interface Summary {
 
 export interface UserPrompt {
   id: number;
-  content_session_id: string;  
-  project: string; 
+  content_session_id: string;
+  project: string;
   platform_source: string;
+  hostname?: string | null;
   prompt_number: number;
   prompt_text: string;
   created_at: string;
@@ -167,9 +175,10 @@ export interface UserPrompt {
 
 export interface DBSession {
   id: number;
-  content_session_id: string;    
+  content_session_id: string;
   project: string;
   platform_source: string;
+  hostname?: string | null;
   user_prompt: string;
   memory_session_id: string | null;  
   status: 'active' | 'completed' | 'failed';

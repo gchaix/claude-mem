@@ -109,6 +109,7 @@ export class SessionManager {
       memorySessionId: null,  // Always start fresh - SDK will capture new ID
       project: dbSession.project,
       platformSource: dbSession.platform_source,
+      hostname: dbSession.hostname ?? null,
       userPrompt,
       pendingMessages: [],
       abortController: new AbortController(),

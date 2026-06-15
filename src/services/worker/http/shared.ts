@@ -89,6 +89,7 @@ export interface ObservationPayload {
   toolResponse: unknown;
   cwd?: string;
   platformSource?: string;
+  hostname?: string;
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
@@ -128,7 +129,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
   let sessionDbId: number;
   let promptNumber: number;
   try {
-    sessionDbId = store.createSDKSession(payload.contentSessionId, project, '', undefined, platformSource);
+    sessionDbId = store.createSDKSession(payload.contentSessionId, project, '', undefined, platformSource, payload.hostname);
     promptNumber = store.getPromptNumberFromUserPrompts(payload.contentSessionId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -139,7 +140,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     return { ok: false, reason: message, status: 500 };
   }
 
-  const privacy = PrivacyCheckValidator.checkUserPromptPrivacy(
+  const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
     store,
     payload.contentSessionId,
     promptNumber,
@@ -147,7 +148,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     sessionDbId,
     { tool_name: payload.toolName }
   );
-  if (!privacy.allow) {
+  if (!userPrompt) {
     return { ok: true, status: 'skipped', reason: 'private' };
   }
 
@@ -186,6 +187,7 @@ export interface PromptPayload {
   prompt: string;
   cwd?: string;
   platformSource?: string;
+  hostname?: string;
   promptNumber?: number;
 }
 
@@ -205,7 +207,7 @@ export function ingestPrompt(payload: PromptPayload): IngestResult {
 
   try {
     const store = dbManager.getSessionStore();
-    const sessionDbId = store.createSDKSession(payload.contentSessionId, project, payload.prompt, undefined, platformSource);
+    const sessionDbId = store.createSDKSession(payload.contentSessionId, project, payload.prompt, undefined, platformSource, payload.hostname);
     return { ok: true, sessionDbId };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -219,6 +221,7 @@ export type SummaryPayload =
       contentSessionId: string;
       lastAssistantMessage?: string;
       platformSource?: string;
+      hostname?: string;
       cwd?: string;
     }
   | {
@@ -243,7 +246,7 @@ export async function ingestSummary(payload: SummaryPayload): Promise<IngestResu
 
     let sessionDbId: number;
     try {
-      sessionDbId = dbManager.getSessionStore().createSDKSession(payload.contentSessionId, project, '', undefined, platformSource);
+      sessionDbId = dbManager.getSessionStore().createSDKSession(payload.contentSessionId, project, '', undefined, platformSource, payload.kind === 'queue' ? payload.hostname : undefined);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { ok: false, reason: message, status: 500 };

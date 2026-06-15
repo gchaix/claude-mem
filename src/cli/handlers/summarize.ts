@@ -6,6 +6,7 @@ import { extractLastMessage } from '../../shared/transcript-parser.js';
 import { stripMemoryTagsFromPrompt } from '../../utils/tag-stripping.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { getHostname } from '../../shared/hostname.js';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
 import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
@@ -73,6 +74,7 @@ export const summarizeHandler: EventHandler = {
     });
 
     const platformSource = normalizePlatformSource(input.platform);
+    const hostname = getHostname();
 
     const runtime = resolveRuntimeContext();
     if (runtime.runtime === 'server-beta') {
@@ -81,6 +83,7 @@ export const summarizeHandler: EventHandler = {
         externalSessionId: sessionId,
         contentSessionId: sessionId,
         platformSource,
+        hostname,
       };
       const occurredAtEpoch = Date.now();
       try {
@@ -101,6 +104,7 @@ export const summarizeHandler: EventHandler = {
           payload: {
             last_assistant_message: lastAssistantMessage,
             platformSource,
+            hostname,
           },
         });
         await runtime.client.endSession({ sessionId: serverSessionId });
@@ -123,6 +127,7 @@ export const summarizeHandler: EventHandler = {
             payload: {
               last_assistant_message: lastAssistantMessage,
               platformSource,
+              hostname,
             },
           });
           // session_end requires a serverSessionId we don't have yet; the
@@ -144,6 +149,7 @@ export const summarizeHandler: EventHandler = {
         contentSessionId: sessionId,
         last_assistant_message: lastAssistantMessage,
         platformSource,
+        hostname,
       },
     );
     if (isWorkerFallback(queueResult)) {

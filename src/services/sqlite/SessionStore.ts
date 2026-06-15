@@ -20,11 +20,13 @@ import { normalizeStoredPromptText } from './prompt-storage.js';
 
 function resolveCreateSessionArgs(
   customTitle?: string,
-  platformSource?: string
-): { customTitle?: string; platformSource?: string } {
+  platformSource?: string,
+  hostname?: string
+): { customTitle?: string; platformSource?: string; hostname?: string } {
   return {
     customTitle,
-    platformSource: platformSource ? normalizePlatformSource(platformSource) : undefined
+    platformSource: platformSource ? normalizePlatformSource(platformSource) : undefined,
+    hostname: hostname?.trim() || undefined,
   };
 }
 
@@ -1627,6 +1629,7 @@ export class SessionStore {
     memory_session_id: string | null;
     project: string;
     platform_source: string;
+    hostname?: string | null;
     user_prompt: string;
     custom_title: string | null;
     status: string;
@@ -1634,6 +1637,7 @@ export class SessionStore {
     const stmt = this.db.prepare(`
       SELECT id, content_session_id, memory_session_id, project,
              COALESCE(platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
+             hostname,
              user_prompt, custom_title, status
       FROM sdk_sessions
       WHERE id = ?
@@ -1646,6 +1650,7 @@ export class SessionStore {
       memory_session_id: string | null;
       project: string;
       platform_source: string;
+      hostname?: string | null;
       user_prompt: string;
       custom_title: string | null;
       status: string;
@@ -1694,17 +1699,18 @@ export class SessionStore {
     project: string,
     userPrompt: string,
     customTitle?: string,
-    platformSource?: string
+    platformSource?: string,
+    hostname?: string
   ): number {
     const now = new Date();
     const nowEpoch = now.getTime();
-    const resolved = resolveCreateSessionArgs(customTitle, platformSource);
+    const resolved = resolveCreateSessionArgs(customTitle, platformSource, hostname);
     const normalizedPlatformSource = resolved.platformSource ?? DEFAULT_PLATFORM_SOURCE;
     const storedUserPrompt = normalizeStoredPromptText(userPrompt);
 
     const existing = this.db.prepare(`
-      SELECT id, platform_source FROM sdk_sessions WHERE content_session_id = ?
-    `).get(contentSessionId) as { id: number; platform_source: string | null } | undefined;
+      SELECT id, platform_source, hostname FROM sdk_sessions WHERE content_session_id = ?
+    `).get(contentSessionId) as { id: number; platform_source: string | null; hostname: string | null } | undefined;
 
     if (existing) {
       if (project) {
@@ -1737,14 +1743,23 @@ export class SessionStore {
           );
         }
       }
+
+      if (resolved.hostname) {
+        this.db.prepare(`
+          UPDATE sdk_sessions SET hostname = ?
+          WHERE content_session_id = ?
+            AND COALESCE(hostname, '') = ''
+        `).run(resolved.hostname, contentSessionId);
+      }
+
       return existing.id;
     }
 
     this.db.prepare(`
       INSERT INTO sdk_sessions
-      (content_session_id, memory_session_id, project, platform_source, user_prompt, custom_title, started_at, started_at_epoch, status)
-      VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'active')
-    `).run(contentSessionId, project, normalizedPlatformSource, storedUserPrompt, resolved.customTitle || null, now.toISOString(), nowEpoch);
+      (content_session_id, memory_session_id, project, platform_source, hostname, user_prompt, custom_title, started_at, started_at_epoch, status)
+      VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 'active')
+    `).run(contentSessionId, project, normalizedPlatformSource, resolved.hostname || null, storedUserPrompt, resolved.customTitle || null, now.toISOString(), nowEpoch);
 
     const row = this.db.prepare('SELECT id FROM sdk_sessions WHERE content_session_id = ?')
       .get(contentSessionId) as { id: number };

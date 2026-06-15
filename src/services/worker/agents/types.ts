@@ -14,6 +14,7 @@ export interface ObservationSSEPayload {
   memory_session_id: string | null;
   session_id: string;
   platform_source: string;
+  hostname?: string | null;
   type: string;
   title: string | null;
   subtitle: string | null;
@@ -32,6 +33,7 @@ export interface SummarySSEPayload {
   id: number;
   session_id: string;
   platform_source: string;
+  hostname?: string | null;
   request: string | null;
   investigated: string | null;
   learned: string | null;

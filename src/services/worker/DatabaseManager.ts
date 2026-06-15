@@ -78,6 +78,7 @@ export class DatabaseManager {
     memory_session_id: string | null;
     project: string;
     platform_source: string;
+    hostname?: string | null;
     user_prompt: string;
     custom_title: string | null;
     status: string;

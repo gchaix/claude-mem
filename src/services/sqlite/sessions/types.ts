@@ -6,6 +6,7 @@ export interface SessionBasic {
   memory_session_id: string | null;
   project: string;
   platform_source: string;
+  hostname?: string | null;
   user_prompt: string;
   custom_title: string | null;
 }
@@ -16,6 +17,7 @@ export interface SessionFull {
   memory_session_id: string;
   project: string;
   platform_source: string;
+  hostname?: string | null;
   user_prompt: string;
   custom_title: string | null;
   started_at: string;

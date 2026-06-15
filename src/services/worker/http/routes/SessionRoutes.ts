@@ -20,9 +20,9 @@ import { getProjectContext } from '../../../../utils/project-name.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { handleGeneratorExit } from '../../session/GeneratorExitHandler.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
+import { isClassified } from '../../provider-errors.js';
 import { SessionCompletionHandler } from '../../session/SessionCompletionHandler.js';
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
-import { USER_PROMPT_DEDUPE_WINDOW_MS } from '../../../../shared/user-prompts.js';
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
 
@@ -127,7 +127,8 @@ export class SessionRoutes extends BaseRouteHandler {
     const agent = provider === 'openrouter' ? this.openRouterAgent : (provider === 'gemini' ? this.geminiAgent : this.sdkAgent);
     const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
 
-    const actualQueueDepth = this.sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId);
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const actualQueueDepth = await pendingStore.getPendingCount(session.sessionDbId);
 
     logger.info('SESSION', `Generator auto-starting (${source}) using ${agentName}`, {
       sessionId: session.sessionDbId,
@@ -153,7 +154,7 @@ export class SessionRoutes extends BaseRouteHandler {
         const errorMsg = error instanceof Error ? error.message : String(error);
 
         if (errorMsg.includes('code 143') || errorMsg.includes('signal SIGTERM')) {
-          logger.warn('SESSION', 'Generator killed by external signal', {
+          logger.warn('SESSION', 'Generator killed by external signal — aborting session to prevent respawn', {
             sessionId: session.sessionDbId,
             provider,
             error: errorMsg
@@ -162,9 +163,31 @@ export class SessionRoutes extends BaseRouteHandler {
           return;
         }
 
-        // No retry: the generator failed, the in-RAM batch is dropped, and the
-        // transcript is the recovery path. The next observation ingest will
-        // start a fresh generator via ensureGeneratorRunning.
+        // Rate-limit / transient provider errors: soft backoff, not failure.
+        // Flag the session so GeneratorExitHandler preserves pending work and
+        // uses an extended backoff schedule that bypasses the restart-guard.
+        if (isClassified(error) && (error.kind === 'rate_limit' || error.kind === 'transient')) {
+          session.abortReason = 'rate-limit';
+          if (error.retryAfterMs !== undefined) {
+            session.retryAfterMs = error.retryAfterMs;
+          }
+          logger.warn('SESSION', 'Rate-limited by provider — will back off and retry', {
+            sessionId: session.sessionDbId,
+            provider,
+            errorKind: error.kind,
+            retryAfterMs: error.retryAfterMs,
+            errorMessage: errorMsg
+          });
+          try {
+            await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+          } catch (dbError) {
+            logger.error('HTTP', 'Failed to reset processing messages after rate-limit', {
+              sessionId: session.sessionDbId
+            }, dbError instanceof Error ? dbError : new Error(String(dbError)));
+          }
+          return;
+        }
+
         logger.error('SESSION', `Generator failed`, {
           sessionId: session.sessionDbId,
           provider: provider,
@@ -184,6 +207,21 @@ export class SessionRoutes extends BaseRouteHandler {
           hook: session.lastGeneratorSource,
           ide: session.platformSource,
         });
+
+        try {
+          const reset = await this.sessionManager.resetProcessingToPending(session.sessionDbId);
+          if (reset > 0) {
+            logger.warn('SESSION', `Reset processing messages after generator error`, {
+              sessionId: session.sessionDbId,
+              reset
+            });
+          }
+        } catch (dbError) {
+          const normalizedDbError = dbError instanceof Error ? dbError : new Error(String(dbError));
+          logger.error('HTTP', 'Failed to reset processing messages after generator error', {
+            sessionId: session.sessionDbId
+          }, normalizedDbError);
+        }
       })
       .finally(async () => {
         const reason = session.abortReason ?? null;
@@ -205,6 +243,12 @@ export class SessionRoutes extends BaseRouteHandler {
         await handleGeneratorExit(session, reason, {
           sessionManager: this.sessionManager,
           completionHandler: this.completionHandler,
+          restartGenerator: (s, source) => {
+            void (async () => {
+              await this.applyTierRouting(s);
+              await this.startGeneratorWithProvider(s, this.getSelectedProvider(), source);
+            })();
+          },
         });
       });
   }
@@ -233,6 +277,7 @@ export class SessionRoutes extends BaseRouteHandler {
     project: z.string().optional(),
     prompt: z.string().optional(),
     platformSource: z.string().optional(),
+    hostname: z.string().optional(),
     customTitle: z.string().optional(),
   }).passthrough();
 
@@ -245,6 +290,7 @@ export class SessionRoutes extends BaseRouteHandler {
     agentId: z.string().optional(),
     agentType: z.string().optional(),
     platformSource: z.string().optional(),
+    hostname: z.string().optional(),
     tool_use_id: z.string().optional(),
     toolUseId: z.string().optional(),
   }).passthrough();
@@ -254,6 +300,7 @@ export class SessionRoutes extends BaseRouteHandler {
     last_assistant_message: z.string().optional(),
     agentId: z.string().optional(),
     platformSource: z.string().optional(),
+    hostname: z.string().optional(),
   }).passthrough();
 
   private handleObservationsByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
@@ -264,6 +311,7 @@ export class SessionRoutes extends BaseRouteHandler {
       tool_response,
       cwd,
       platformSource,
+      hostname,
       agentId,
       agentType,
       tool_use_id,
@@ -277,6 +325,7 @@ export class SessionRoutes extends BaseRouteHandler {
       toolResponse: tool_response,
       cwd,
       platformSource,
+      hostname,
       agentId,
       agentType,
       toolUseId: typeof tool_use_id === 'string' ? tool_use_id : (typeof toolUseId === 'string' ? toolUseId : undefined),
@@ -298,6 +347,7 @@ export class SessionRoutes extends BaseRouteHandler {
   private handleSummarizeByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { contentSessionId, last_assistant_message, agentId } = req.body;
     const platformSource = normalizePlatformSource(req.body.platformSource);
+    const hostname = typeof req.body.hostname === 'string' ? req.body.hostname : undefined;
 
     if (agentId) {
       res.json({ status: 'skipped', reason: 'subagent_context' });
@@ -306,17 +356,17 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const store = this.dbManager.getSessionStore();
 
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '', undefined, platformSource);
+    const sessionDbId = store.createSDKSession(contentSessionId, '', '', undefined, platformSource, hostname);
     const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
 
-    const privacy = PrivacyCheckValidator.checkUserPromptPrivacy(
+    const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
       store,
       contentSessionId,
       promptNumber,
       'summarize',
       sessionDbId
     );
-    if (!privacy.allow) {
+    if (!userPrompt) {
       res.json({ status: 'skipped', reason: 'private' });
       return;
     }
@@ -349,7 +399,8 @@ export class SessionRoutes extends BaseRouteHandler {
       return;
     }
 
-    const queueLength = this.sessionManager.getMessageBuffer().getPendingCount(sessionDbId);
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const queueLength = await pendingStore.getPendingCount(sessionDbId);
 
     res.json({
       status: 'active',
@@ -366,6 +417,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const project = req.body.project || 'unknown';
     const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : undefined;
     const platformSource = normalizePlatformSource(req.body.platformSource);
+    const hostname = typeof req.body.hostname === 'string' ? req.body.hostname : undefined;
     const customTitle = req.body.customTitle || undefined;
 
     // Server-side guard: reject observer-sessions before creating DB rows.
@@ -411,7 +463,7 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const store = this.dbManager.getSessionStore();
 
-    const sessionDbId = store.createSDKSession(contentSessionId, project, prompt, customTitle, platformSource);
+    const sessionDbId = store.createSDKSession(contentSessionId, project, prompt, customTitle, platformSource, hostname);
 
     const dbSession = store.getSessionById(sessionDbId);
     const isNewSession = !dbSession?.memory_session_id;
@@ -443,31 +495,6 @@ export class SessionRoutes extends BaseRouteHandler {
         promptNumber,
         skipped: true,
         reason: 'private'
-      });
-      return;
-    }
-
-    const duplicatePrompt = store.findRecentDuplicateUserPrompt(
-      contentSessionId,
-      cleanedPrompt,
-      USER_PROMPT_DEDUPE_WINDOW_MS
-    );
-
-    if (duplicatePrompt) {
-      const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined;
-      logger.debug('SESSION', 'Duplicate user prompt skipped', {
-        sessionId: sessionDbId,
-        promptNumber: duplicatePrompt.prompt_number,
-        duplicatePromptId: duplicatePrompt.id,
-        contextInjected
-      });
-
-      res.json({
-        sessionDbId,
-        promptNumber: duplicatePrompt.prompt_number,
-        skipped: true,
-        reason: 'duplicate',
-        contextInjected
       });
       return;
     }
@@ -555,7 +582,8 @@ export class SessionRoutes extends BaseRouteHandler {
 
     session.modelOverride = undefined;
 
-    const pending = this.sessionManager.getMessageBuffer().peekTypes(session.sessionDbId);
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const pending = await pendingStore.peekPendingTypes(session.sessionDbId);
 
     if (pending.length === 0) {
       session.modelOverride = undefined;

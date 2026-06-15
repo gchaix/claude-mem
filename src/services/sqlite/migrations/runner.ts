@@ -38,7 +38,9 @@ export class MigrationRunner {
     this.dropWorkerPidColumn();
     this.createServerOwnedTables();
     this.rebuildPendingMessagesForFinalQueueSchema();
+    this.addFailedStateAndRetryCountToPendingMessages();
     this.createOfflineEventQueue();
+    this.addSessionHostnameColumn();
   }
 
   private initializeSchema(): void {
@@ -1147,6 +1149,130 @@ export class MigrationRunner {
   }
 
   /**
+   * Migration 35: re-introduce 'failed' status and retry_count for
+   * rate-limit resilience. Upstream migration 34 canonicalized the status
+   * CHECK constraint to ('pending', 'processing') only — fine for the
+   * short-run case, but it means a poison message (always-failing parse,
+   * 429 storm that exhausts in-memory retry budget, etc.) has nowhere to
+   * land except being silently cleared by the restart-guard path.
+   *
+   * This migration restores:
+   *   - status CHECK now includes 'failed'
+   *   - retry_count INTEGER NOT NULL DEFAULT 0
+   *   - completed_at_epoch INTEGER (nullable; stamped on terminal state)
+   *
+   * Paired with PendingMessageStore.markFailed / markRateLimited and the
+   * SessionManager.triageFailedMessages startup path.
+   */
+  private addFailedStateAndRetryCountToPendingMessages(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(35) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const table = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_messages'").get() as { sql: string } | null;
+    if (!table) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      return;
+    }
+
+    const cols = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    const colNames = new Set(cols.map(c => c.name));
+    const alreadyHasFailedCheck = table.sql.includes("'failed'");
+    const alreadyHasRetryCount = colNames.has('retry_count');
+    const alreadyHasCompletedAt = colNames.has('completed_at_epoch');
+
+    // Fast path: already at target shape.
+    if (alreadyHasFailedCheck && alreadyHasRetryCount && alreadyHasCompletedAt) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      return;
+    }
+
+    logger.debug('DB', 'Migration 35: extending pending_messages with failed status + retry_count');
+
+    this.db.run('PRAGMA foreign_keys = OFF');
+    this.db.run('BEGIN TRANSACTION');
+    try {
+      this.db.run('DROP TABLE IF EXISTS pending_messages_m35');
+
+      this.db.run(`
+        CREATE TABLE pending_messages_m35 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_db_id INTEGER NOT NULL,
+          content_session_id TEXT NOT NULL,
+          tool_use_id TEXT,
+          message_type TEXT NOT NULL CHECK(message_type IN ('observation', 'summarize')),
+          tool_name TEXT,
+          tool_input TEXT,
+          tool_response TEXT,
+          cwd TEXT,
+          last_user_message TEXT,
+          last_assistant_message TEXT,
+          prompt_number INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'failed')),
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          created_at_epoch INTEGER NOT NULL,
+          completed_at_epoch INTEGER,
+          agent_type TEXT,
+          agent_id TEXT,
+          FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
+        )
+      `);
+
+      const hasCol = (name: string) => colNames.has(name);
+      this.db.run(`
+        INSERT INTO pending_messages_m35 (
+          id, session_db_id, content_session_id, tool_use_id, message_type,
+          tool_name, tool_input, tool_response, cwd, last_user_message,
+          last_assistant_message, prompt_number, status, retry_count,
+          created_at_epoch, completed_at_epoch, agent_type, agent_id
+        )
+        SELECT
+          id,
+          session_db_id,
+          content_session_id,
+          tool_use_id,
+          message_type,
+          tool_name,
+          tool_input,
+          tool_response,
+          cwd,
+          last_user_message,
+          last_assistant_message,
+          prompt_number,
+          status,
+          ${hasCol('retry_count') ? 'retry_count' : '0'},
+          created_at_epoch,
+          ${hasCol('completed_at_epoch') ? 'completed_at_epoch' : 'NULL'},
+          agent_type,
+          agent_id
+        FROM pending_messages
+      `);
+
+      this.db.run('DROP TABLE pending_messages');
+      this.db.run('ALTER TABLE pending_messages_m35 RENAME TO pending_messages');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_session ON pending_messages(session_db_id)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_status ON pending_messages(status)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_claude_session ON pending_messages(content_session_id)');
+      this.db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_session_tool
+        ON pending_messages(content_session_id, tool_use_id)
+        WHERE tool_use_id IS NOT NULL
+      `);
+
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(35, new Date().toISOString());
+      this.db.run('COMMIT');
+      this.db.run('PRAGMA foreign_keys = ON');
+      logger.debug('DB', 'Migration 35 complete: pending_messages now supports failed status + retry_count');
+    } catch (error) {
+      this.db.run('ROLLBACK');
+      this.db.run('PRAGMA foreign_keys = ON');
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`Migration 35 failed: ${String(error)}`);
+    }
+  }
+
+  /**
    * Migration 36: create offline_event_queue for durable buffering of
    * server-beta hook events when the remote worker is unreachable. This table
    * has no foreign-key dependencies so it can be written from hook processes
@@ -1179,5 +1305,38 @@ export class MigrationRunner {
     ).run(36, new Date().toISOString());
 
     logger.debug('DB', 'Migration 36: created offline_event_queue table');
+  }
+
+  /**
+   * Migration 37: add hostname column to sdk_sessions.
+   *
+   * Captures the originating machine's hostname so that observations can be
+   * attributed to the machine that generated them. This matters in setups where
+   * hooks on one machine (e.g. Roger) submit to a worker running on another
+   * machine (e.g. Sonic): os.hostname() inside the worker would always return
+   * the worker host, so hostname must be captured at the hook layer and carried
+   * in the payload.
+   *
+   * Column is nullable TEXT with no default. Pre-migration rows are NULL and
+   * render with no badge in the UI (preferred over a misleading 'unknown' chip).
+   */
+  private addSessionHostnameColumn(): void {
+    const applied = this.db.prepare(
+      'SELECT version FROM schema_versions WHERE version = ?'
+    ).get(37) as SchemaVersion | undefined;
+
+    const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'hostname');
+
+    if (applied && hasColumn) return;
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE sdk_sessions ADD COLUMN hostname TEXT');
+      logger.debug('DB', 'Migration 37: added hostname column to sdk_sessions table');
+    }
+
+    this.db.prepare(
+      'INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)'
+    ).run(37, new Date().toISOString());
   }
 }

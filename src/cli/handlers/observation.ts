@@ -5,6 +5,7 @@ import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { getHostname } from '../../shared/hostname.js';
 import { resolveRuntimeContext, logServerBetaFallback } from '../../services/hooks/runtime-selector.js';
 import { isServerBetaClientError } from '../../services/hooks/server-beta-client.js';
 import { OfflineEventQueue } from '../../services/sqlite/OfflineEventQueue.js';
@@ -13,6 +14,7 @@ import { drainOfflineQueue } from '../../services/hooks/offline-drain.js';
 async function dispatchToWorker(
   input: NormalizedHookInput,
   platformSource: string,
+  hostname: string,
 ): Promise<HookResult> {
   const result = await executeWithWorkerFallback<{ status?: string }>(
     '/api/sessions/observations',
@@ -20,6 +22,7 @@ async function dispatchToWorker(
     {
       contentSessionId: input.sessionId,
       platformSource,
+      hostname,
       tool_name: input.toolName,
       tool_input: input.toolInput,
       tool_response: input.toolResponse,
@@ -41,6 +44,7 @@ export const observationHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
     const platformSource = normalizePlatformSource(input.platform);
+    const hostname = getHostname();
 
     if (!toolName) {
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
@@ -72,6 +76,7 @@ export const observationHandler: EventHandler = {
           agentId: input.agentId,
           agentType: input.agentType,
           platformSource,
+          hostname,
         },
       };
       try {
@@ -98,6 +103,6 @@ export const observationHandler: EventHandler = {
       }
     }
 
-    return dispatchToWorker(input, platformSource);
+    return dispatchToWorker(input, platformSource, hostname);
   },
 };

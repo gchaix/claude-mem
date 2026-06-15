@@ -17,6 +17,11 @@ export function PromptCard({ prompt }: PromptCardProps) {
           <span className={`card-source source-${prompt.platform_source || 'claude'}`}>
             {prompt.platform_source || 'claude'}
           </span>
+          {prompt.hostname && (
+            <span className="card-host" title={prompt.hostname}>
+              🖥 {prompt.hostname.split('.')[0]}
+            </span>
+          )}
           <span className="card-project">{prompt.project}</span>
         </div>
       </div>

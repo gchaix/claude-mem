@@ -382,6 +382,17 @@ export class SessionManager {
     return this.buffer.getTotalDepth();
   }
 
+  // tag1: SessionRoutes consumers expect a queue accessor with getPendingCount()
+  // and peekTypes(). In v13.4 this was getPendingMessageStore() returning the
+  // SQL-backed PendingMessageStore; v13.6 moved the queue into the in-memory
+  // SessionMessageBuffer (this.buffer) and removed PendingMessageStore.ts.
+  // Expose the buffer through the historical accessor name so callers keep
+  // working with the equivalent API (getPendingCount/peekTypes both exist on
+  // the buffer with matching semantics).
+  getPendingMessageStore(): SessionMessageBuffer {
+    return this.buffer;
+  }
+
   async getTotalActiveWork(): Promise<number> {
     return this.getTotalQueueDepth();
   }

@@ -128,7 +128,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const agentName = provider === 'openrouter' ? 'OpenRouter' : (provider === 'gemini' ? 'Gemini' : 'Claude SDK');
 
     const pendingStore = this.sessionManager.getPendingMessageStore();
-    const actualQueueDepth = await pendingStore.getPendingCount(session.sessionDbId);
+    const actualQueueDepth = pendingStore.getPendingCount(session.sessionDbId);
 
     logger.info('SESSION', `Generator auto-starting (${source}) using ${agentName}`, {
       sessionId: session.sessionDbId,
@@ -400,7 +400,7 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     const pendingStore = this.sessionManager.getPendingMessageStore();
-    const queueLength = await pendingStore.getPendingCount(sessionDbId);
+    const queueLength = pendingStore.getPendingCount(sessionDbId);
 
     res.json({
       status: 'active',
@@ -583,7 +583,7 @@ export class SessionRoutes extends BaseRouteHandler {
     session.modelOverride = undefined;
 
     const pendingStore = this.sessionManager.getPendingMessageStore();
-    const pending = await pendingStore.peekPendingTypes(session.sessionDbId);
+    const pending = pendingStore.peekTypes(session.sessionDbId);
 
     if (pending.length === 0) {
       session.modelOverride = undefined;
